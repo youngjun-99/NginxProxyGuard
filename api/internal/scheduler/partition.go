@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"nginx-proxy-guard/internal/database/dialect"
 	"nginx-proxy-guard/internal/repository"
 )
 
@@ -108,6 +109,12 @@ func (s *PartitionScheduler) isHypertable(ctx context.Context, table string) boo
 }
 
 func (s *PartitionScheduler) run() {
+	// MySQL has no partitions, chunks or PL/pgSQL helpers to manage: its log
+	// tables are plain InnoDB tables and retention is a batched row DELETE.
+	if dialect.IsMySQL() {
+		s.runMySQL()
+		return
+	}
 	s.createPartitions()
 	s.enforceRetention()
 	s.cleanupLogsTable()

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sort"
 	"time"
+
+	"nginx-proxy-guard/internal/database/dialect"
 )
 
 // Traffic counts completed HTTP access requests and response body bytes only.
@@ -327,7 +329,11 @@ func (r *DashboardRepository) BackfillTrafficHourly(ctx context.Context, now tim
 	if first := earliest.Time.UTC().Truncate(time.Hour); from.Before(first) {
 		from = first
 	}
-	if _, err = tx.ExecContext(ctx, hourlyHostRollupSQL, from, to); err != nil {
+	hostRollup, hostArgs := hourlyHostRollupSQL, []interface{}{from, to}
+	if dialect.IsMySQL() {
+		hostRollup, hostArgs = dialect.Raw(mysqlHourlyHostRollupSQL), []interface{}{from.UTC().Truncate(time.Hour), to.UTC()}
+	}
+	if _, err = tx.ExecContext(ctx, hostRollup, hostArgs...); err != nil {
 		return from, to, false, fmt.Errorf("backfill hourly proxy hosts: %w", err)
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE traffic_hourly_backfill SET next_hour = $1, updated_at = now() WHERE id = 1`, from); err != nil {

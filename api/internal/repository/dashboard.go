@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
+	"nginx-proxy-guard/internal/database/dialect"
 	"nginx-proxy-guard/internal/model"
 )
 
@@ -283,7 +284,8 @@ func (r *DashboardRepository) getTopHosts(ctx context.Context, since time.Time) 
 // (#380). One aggregation feeds both.
 func (r *DashboardRepository) getTopIPs(ctx context.Context, since time.Time) (public, private []model.IPStat) {
 	public, private = []model.IPStat{}, []model.IPStat{}
-	rows, err := r.db.QueryContext(ctx, `
+	//npg:pg-only
+	query := `
 		WITH counts AS (
 			SELECT client_ip, COUNT(*) AS total,
 			       (client_ip <<= '127.0.0.0/8'::inet OR
@@ -295,14 +297,41 @@ func (r *DashboardRepository) getTopIPs(ctx context.Context, since time.Time) (p
 			WHERE created_at >= $1
 			  AND log_type = 'access'
 			  AND client_ip IS NOT NULL
-			  AND `+canaryURIExclusion+`
+			  AND ` + canaryURIExclusion + `
 			GROUP BY client_ip
 		)
 		(SELECT HOST(client_ip), total, is_local FROM counts WHERE NOT is_local ORDER BY total DESC LIMIT 10)
 		UNION ALL
 		(SELECT HOST(client_ip), total, is_local FROM counts WHERE is_local ORDER BY total DESC LIMIT 10)
 		ORDER BY 2 DESC
-	`, since)
+	`
+	if dialect.IsMySQL() {
+		// No inet containment on MySQL: the same five ranges as binary bounds.
+		// COALESCE keeps a value INET6_ATON cannot parse in the public list
+		// rather than out of both.
+		var local []string
+		for _, cidr := range []string{"127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"} {
+			p, _ := mysqlInCIDR("client_ip", cidr)
+			local = append(local, p)
+		}
+		//npg:mysql
+		query = dialect.Raw(`
+		WITH counts AS (
+			SELECT client_ip, COUNT(*) AS total,
+			       COALESCE(` + strings.Join(local, " OR ") + `, FALSE) AS is_local
+			FROM logs_partitioned
+			WHERE created_at >= ?
+			  AND log_type = 'access'
+			  AND client_ip IS NOT NULL
+			  AND ` + canaryURIExclusion + `
+			GROUP BY client_ip
+		)
+		(SELECT client_ip, total, is_local FROM counts WHERE NOT is_local ORDER BY total DESC LIMIT 10)
+		UNION ALL
+		(SELECT client_ip, total, is_local FROM counts WHERE is_local ORDER BY total DESC LIMIT 10)
+		ORDER BY 2 DESC`)
+	}
+	rows, err := r.db.QueryContext(ctx, query, since)
 	if err != nil {
 		return public, private
 	}
@@ -389,7 +418,15 @@ func (r *DashboardRepository) GetDigestResources(ctx context.Context) (*DigestRe
 	// counts only the chunks TimescaleDB still tracks, which on this dev
 	// install reported 197MB against a real 740MB — orphaned chunk relations,
 	// telemetry tables and catalogue bloat are all invisible to it.
-	if err := r.db.QueryRowContext(ctx, `SELECT pg_database_size(current_database())`).Scan(&res.DatabaseBytes); err != nil {
+	if dialect.IsMySQL() {
+		// MySQL: the data and index bytes of every table in the database.
+		if err := queryFreshTableStats(ctx, r.db,
+			"SELECT COALESCE(SUM(DATA_LENGTH + INDEX_LENGTH), 0) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE()",
+			nil, &res.DatabaseBytes); err != nil {
+			return nil, fmt.Errorf("failed to read database size: %w", err)
+		}
+		//npg:pg-only
+	} else if err := r.db.QueryRowContext(ctx, `SELECT pg_database_size(current_database())`).Scan(&res.DatabaseBytes); err != nil {
 		return nil, fmt.Errorf("failed to read database size: %w", err)
 	}
 
@@ -482,14 +519,28 @@ func (r *DashboardRepository) GetBlockBreakdown(ctx context.Context, since time.
 
 func (r *DashboardRepository) getTopCountries(ctx context.Context, since time.Time) []model.CountryStat {
 	// Aggregate from JSONB top_countries column
-	rows, err := r.db.QueryContext(ctx, `
+	//npg:pg-only
+	query := `
 		SELECT key, SUM(value::INT) as total
 		FROM dashboard_stats_hourly, jsonb_each_text(top_countries)
 		WHERE hour_bucket >= $1
 		GROUP BY key
 		ORDER BY total DESC
 		LIMIT 10
-	`, since)
+	`
+	if dialect.IsMySQL() {
+		// No jsonb_each_text: JSON_TABLE over the object's keys, each key's
+		// value read back by path.
+		query = dialect.Raw(`
+		SELECT k.country, SUM(CAST(JSON_UNQUOTE(JSON_EXTRACT(h.top_countries, CONCAT('$."', k.country, '"'))) AS SIGNED)) AS total
+		FROM dashboard_stats_hourly h
+		CROSS JOIN JSON_TABLE(JSON_KEYS(h.top_countries), '$[*]' COLUMNS (country VARCHAR(64) PATH '$')) AS k
+		WHERE h.hour_bucket >= ?
+		GROUP BY k.country
+		ORDER BY total DESC
+		LIMIT 10`)
+	}
+	rows, err := r.db.QueryContext(ctx, query, since)
 	if err != nil {
 		return []model.CountryStat{}
 	}

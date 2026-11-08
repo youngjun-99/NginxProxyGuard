@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/lib/pq"
 
+	"nginx-proxy-guard/internal/database/dialect"
 	"nginx-proxy-guard/internal/model"
 )
 
@@ -54,6 +56,8 @@ type dnsEntryQuerier interface {
 // exception lists keep their names in text[] columns without a CHECK, so
 // those branches take only elements in the characters of a stored name,
 // and listDNSReferences checks the rest.
+//
+//npg:pg-only
 const dnsReferenceSources = `
 	SELECT 'acl:' || i.access_list_id::text, i.hostname, l.id::text, l.name
 	FROM access_list_items i JOIN access_lists l ON l.id = i.access_list_id
@@ -90,8 +94,71 @@ const dnsReferenceSources = `
 	FROM system_settings s CROSS JOIN LATERAL unnest(s.global_trusted_hostnames) AS n(name)
 	WHERE n.name ~ '^[a-z0-9.-]{1,253}$'`
 
+//npg:pg-only
 const dnsReferencesQuery = dnsReferenceSources + `
 	ORDER BY 1, 2`
+
+// mysqlDNSReferenceSources is dnsReferenceSources for MySQL, which keeps a
+// text[] column as its lib/pq literal: JSON_TABLE over the array's JSON view
+// stands in for unnest, element [1] is JSON path $[0], and ~ is a
+// case-sensitive REGEXP_LIKE (PostgreSQL's ~ is case-sensitive too).
+var mysqlDNSReferenceSources = strings.NewReplacer(
+	"{u}", mysqlArrayJSON("u.exception_hostnames"),
+	"{gu}", mysqlArrayJSON("g.exception_hostnames"),
+	"{r}", mysqlArrayJSON("r.allowed_hostnames"),
+	"{gr}", mysqlArrayJSON("g.allowed_hostnames"),
+	"{rl}", mysqlArrayJSON("r.whitelist_hostnames"),
+	"{grl}", mysqlArrayJSON("g.whitelist_hostnames"),
+	"{s}", mysqlArrayJSON("s.global_trusted_hostnames"),
+	"{first}", "COALESCE(JSON_UNQUOTE(JSON_EXTRACT("+mysqlArrayJSON("h.domain_names")+", '$[0]')), '')",
+	"{name}", "REGEXP_LIKE(n.name, '^[a-z0-9.-]{1,253}$', 'c')",
+	"{cols}", "COLUMNS (name VARCHAR(512) PATH '$')",
+
+//npg:mysql: a MySQL template; the {placeholders} are filled in above
+).Replace(`
+	SELECT CONCAT('acl:', i.access_list_id), i.hostname, l.id, l.name
+	FROM access_list_items i JOIN access_lists l ON l.id = i.access_list_id
+	WHERE i.hostname IS NOT NULL
+	UNION ALL
+	SELECT CONCAT('uri:', u.proxy_host_id), n.name, u.proxy_host_id, {first}
+	FROM uri_blocks u LEFT JOIN proxy_hosts h ON h.id = u.proxy_host_id
+	CROSS JOIN JSON_TABLE({u}, '$[*]' {cols}) AS n
+	WHERE {name}
+	UNION ALL
+	SELECT 'uri:global', n.name, 'global', ''
+	FROM global_uri_blocks g CROSS JOIN JSON_TABLE({gu}, '$[*]' {cols}) AS n
+	WHERE {name}
+	UNION ALL
+	SELECT CONCAT('prio:', r.proxy_host_id), n.name, r.proxy_host_id, {first}
+	FROM geo_restrictions r LEFT JOIN proxy_hosts h ON h.id = r.proxy_host_id
+	CROSS JOIN JSON_TABLE({r}, '$[*]' {cols}) AS n
+	WHERE {name}
+	UNION ALL
+	SELECT 'prio:global', n.name, 'global', ''
+	FROM global_geo_restrictions g CROSS JOIN JSON_TABLE({gr}, '$[*]' {cols}) AS n
+	WHERE {name}
+	UNION ALL
+	SELECT CONCAT('rl:', r.proxy_host_id), n.name, r.proxy_host_id, {first}
+	FROM rate_limits r LEFT JOIN proxy_hosts h ON h.id = r.proxy_host_id
+	CROSS JOIN JSON_TABLE({rl}, '$[*]' {cols}) AS n
+	WHERE {name}
+	UNION ALL
+	SELECT 'rl:global', n.name, 'global', ''
+	FROM global_rate_limits g CROSS JOIN JSON_TABLE({grl}, '$[*]' {cols}) AS n
+	WHERE {name}
+	UNION ALL
+	SELECT 'trusted', n.name, '', ''
+	FROM system_settings s CROSS JOIN JSON_TABLE({s}, '$[*]' {cols}) AS n
+	WHERE {name}`)
+
+// referencesQuery is dnsReferencesQuery for the active engine.
+func referencesQuery() string {
+	if dialect.IsMySQL() {
+		return dialect.Raw(mysqlDNSReferenceSources + `
+	ORDER BY 1, 2`)
+	}
+	return dnsReferencesQuery
+}
 
 // dnsEntryStateColumns are the columns UpsertState writes, in the order of
 // dnsEntryStateArgs. dnsEntryStateSelect reads the same columns in the same
@@ -234,7 +301,7 @@ func (t *dnsEntryTx) DeleteState(ctx context.Context, hostname string) error {
 }
 
 func listDNSReferences(ctx context.Context, q dnsEntryQuerier) ([]model.DNSReference, error) {
-	rows, err := q.QueryContext(ctx, dnsReferencesQuery)
+	rows, err := q.QueryContext(ctx, referencesQuery())
 	if err != nil {
 		return nil, fmt.Errorf("failed to read domain entry references: %w", err)
 	}

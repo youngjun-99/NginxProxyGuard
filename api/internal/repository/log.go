@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"nginx-proxy-guard/internal/database"
+	"nginx-proxy-guard/internal/database/dialect"
 	"nginx-proxy-guard/internal/model"
 	"nginx-proxy-guard/pkg/cache"
 
@@ -676,6 +677,17 @@ func (r *LogRepository) List(ctx context.Context, filter *model.LogFilter, page,
 			exactPlaceholders := make([]string, 0, len(filter.ExcludeIPs))
 			for _, ip := range filter.ExcludeIPs {
 				if strings.Contains(ip, "/") {
+					if dialect.IsMySQL() {
+						// No inet type on MySQL: the range becomes binary bounds
+						// (no placeholder). The handler validated it; one that
+						// still does not parse excludes nothing, rather than
+						// failing the whole search.
+						if p, ok := mysqlInCIDR("client_ip", ip); ok {
+							conditions = append(conditions, "(client_ip IS NULL OR NOT "+p+")")
+						}
+						continue
+					}
+					//npg:pg-only
 					conditions = append(conditions, fmt.Sprintf("(client_ip IS NULL OR NOT (client_ip <<= $%d::inet))", argIndex))
 					args = append(args, ip)
 					argIndex++

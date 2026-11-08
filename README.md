@@ -164,7 +164,7 @@ Also since June: saved log filter presets (v2.33.0), a per-IP activity view for 
 | Technology | Purpose |
 |------------|---------|
 | **Nginx 1.30.4** | High-performance HTTP and stream reverse proxy core with HTTP/3 & QUIC support |
-| **TimescaleDB (PostgreSQL 17)** | Time-series-optimized database with automatic log compression |
+| **TimescaleDB (PostgreSQL 17)** _or_ **MySQL 8.4** | Time-series-optimized database with automatic log compression; MySQL is a supported alternative (see [Running on MySQL](#running-on-mysql-optional)) |
 | **Valkey 9** | Redis-compatible high-speed caching and session management (optional) |
 | **Go 1.26 (Echo v4)** | Backend API with efficient resource management and concurrency |
 | **React 19 & TypeScript 6** | Type-safe, component-based modern UI (Vite 8 + Tailwind 4) |
@@ -200,6 +200,26 @@ sed -i "s/JWT_SECRET=.*/JWT_SECRET=$(openssl rand -hex 32)/" .env
 # 4. Start services
 docker compose up -d
 ```
+
+### Running on MySQL (optional)
+
+TimescaleDB/PostgreSQL stays the default and the recommended engine. NPG also runs on **MySQL 8.4 LTS** (8.0.17 or later), for hosts that already operate MySQL or would rather not run PostgreSQL. Download the overlay next to `docker-compose.yml` and start both files together:
+
+```bash
+wget https://raw.githubusercontent.com/svrforum/nginxproxyguard/main/docker-compose.mysql.yml
+# DB_USER must not be "root" with the MySQL image; the overlay defaults to "npg".
+sed -i "s/^DB_USER=.*/DB_USER=npg/" .env
+echo "COMPOSE_FILE=docker-compose.yml:docker-compose.mysql.yml" >> .env
+docker compose up -d
+```
+
+To use an existing MySQL server instead, create the database with `CREATE DATABASE nginx_proxy_guard CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;` and set `DATABASE_URL=mysql://user:password@host:3306/nginx_proxy_guard` on the `api` service. The schema is created and upgraded automatically on startup, as on PostgreSQL.
+
+What is different on MySQL:
+
+- **No TimescaleDB features.** Log compression, the raw-log reclaim job (Settings › Maintenance, shown as unavailable) and DiskGuard's emergency compression are PostgreSQL-only; disk-usage alerts still work. Log retention deletes expired rows in batches instead of dropping chunks.
+- **Log text search scans.** `%substring%` filters on URIs and user agents are served by pg_trgm indexes on PostgreSQL; MySQL has no equivalent, so the search scans the time range you select.
+- **The engine is chosen once.** There is no in-place migration between engines. To switch, install fresh on the other engine and restore an NPG backup (Settings › Backup) — backups are exported by the API and are engine-independent.
 
 ### Access
 
@@ -297,11 +317,13 @@ The raw OpenAPI 3.0 spec is at `https://localhost:81/api/docs/swagger.yaml`.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `DB_PASSWORD` | PostgreSQL password | (required) |
+| `DB_PASSWORD` | Database password | (required) |
 | `JWT_SECRET` | Application secret — set it to a random value (`openssl rand -hex 32`) | placeholder in `docker-compose.yml` (change it) |
 | `TZ` | Timezone | `UTC` |
-| `DB_USER` | PostgreSQL user | `postgres` |
+| `DB_USER` | Database user (not `root` on MySQL) | `postgres` (`npg` with the MySQL overlay) |
 | `DB_NAME` | Database name | `nginx_proxy_guard` |
+| `DATABASE_URL` | Full connection URL; `postgres://…` or `mysql://…` picks the engine | built from the variables above |
+| `DB_ROOT_PASSWORD` / `MYSQL_BUFFER_POOL` | MySQL overlay only: root password and InnoDB buffer pool size | `DB_PASSWORD` / `512M` |
 | `DOCKER_API_VERSION` | Docker API version (for Synology) | auto-detect |
 | `UI_PORT` | Admin panel host port | `81` |
 | `NGINX_HTTP_PORT` / `NGINX_HTTPS_PORT` | nginx listen ports (host network mode; change when 80/443 are already taken, e.g. Synology DSM) | `80` / `443` |

@@ -54,10 +54,19 @@ type dbLocator struct {
 	lookup func(ctx context.Context, host string) ([]string, error)
 }
 
-// databaseHost extracts the host from a URL or key=value DSN.
+// databaseHost extracts the host from a URL or key=value DSN, or from
+// go-sql-driver's native user:pass@tcp(host:port)/db form.
 func databaseHost(dsn string) string {
-	if u, err := url.Parse(dsn); err == nil && (u.Scheme == "postgres" || u.Scheme == "postgresql") {
+	if u, err := url.Parse(dsn); err == nil && (u.Scheme == "postgres" || u.Scheme == "postgresql" || u.Scheme == "mysql") {
 		return u.Hostname()
+	}
+	if _, rest, ok := strings.Cut(dsn, "@tcp("); ok {
+		if addr, _, ok := strings.Cut(rest, ")"); ok {
+			if host, _, err := net.SplitHostPort(addr); err == nil {
+				return host
+			}
+			return addr
+		}
 	}
 	for _, kv := range strings.Fields(dsn) {
 		if v, ok := strings.CutPrefix(kv, "host="); ok {

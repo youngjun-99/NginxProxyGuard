@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 
+	"nginx-proxy-guard/internal/database/dialect"
 	"nginx-proxy-guard/internal/model"
 )
 
@@ -35,6 +37,8 @@ func NewBannedIPStatsRepository(db *sql.DB) *BannedIPStatsRepository {
 // the largest install at 30 days). created_at is the insert time, never before
 // the request's timestamp, so with a day of margin it drops no row the window
 // keeps.
+//
+//npg:pg-only
 const bannedIPTrafficQuery = `
 WITH scoped AS MATERIALIZED (
     SELECT host, request_uri, block_reason, geo_country, geo_country_code, timestamp
@@ -84,6 +88,56 @@ LEFT JOIN uris    u ON true`
 //
 // A malformed address would make PostgreSQL reject the ::inet cast with a
 // 500; callers validate before reaching here.
+// mysqlBannedIPTrafficQuery is bannedIPTrafficQuery for MySQL: json_agg over
+// a whole row becomes JSON_ARRAYAGG(JSON_OBJECT(...)) with the same keys,
+// FILTER becomes CASE, make_interval becomes INTERVAL n DAY, and client_ip is
+// the address as text. Arguments: ip, windowDays, windowDays + 1. JSON_ARRAYAGG
+// does not promise to keep its input's order, so GetStats re-sorts the lists.
+const mysqlBannedIPTrafficQuery = `
+WITH scoped AS (
+    SELECT host, request_uri, block_reason, geo_country, geo_country_code, ` + "`timestamp`" + ` AS ts
+    FROM logs_partitioned
+    WHERE client_ip = ?
+      AND ` + "`timestamp`" + ` > NOW(6) - INTERVAL ? DAY
+      AND created_at > NOW(6) - INTERVAL ? DAY
+      AND (request_uri NOT LIKE '/__npg_canary%' OR request_uri IS NULL)
+),
+totals AS (
+    SELECT COUNT(*) AS total,
+           COUNT(CASE WHEN block_reason <> 'none' THEN 1 END) AS blocked,
+           MIN(ts) AS first_seen,
+           MAX(ts) AS last_seen
+    FROM scoped
+),
+country AS (
+    SELECT geo_country, geo_country_code
+    FROM scoped
+    WHERE geo_country_code IS NOT NULL AND geo_country_code <> ''
+    GROUP BY 1, 2
+    ORDER BY COUNT(*) DESC
+    LIMIT 1
+),
+hosts AS (
+    SELECT JSON_ARRAYAGG(JSON_OBJECT('name', name, 'count', cnt)) AS items FROM (
+        SELECT host AS name, COUNT(*) AS cnt
+        FROM scoped WHERE host IS NOT NULL AND host <> ''
+        GROUP BY 1 ORDER BY 2 DESC LIMIT 3
+    ) t
+),
+uris AS (
+    SELECT JSON_ARRAYAGG(JSON_OBJECT('name', name, 'count', cnt)) AS items FROM (
+        SELECT request_uri AS name, COUNT(*) AS cnt
+        FROM scoped WHERE request_uri IS NOT NULL AND request_uri <> ''
+        GROUP BY 1 ORDER BY 2 DESC LIMIT 5
+    ) t
+)
+SELECT t.total, t.blocked, t.first_seen, t.last_seen,
+       c.geo_country, c.geo_country_code, h.items, u.items
+FROM totals t
+LEFT JOIN country c ON true
+LEFT JOIN hosts   h ON true
+LEFT JOIN uris    u ON true`
+
 func (r *BannedIPStatsRepository) GetStats(ctx context.Context, ip string, windowDays int) (*model.BannedIPStats, error) {
 	stats := &model.BannedIPStats{
 		IPAddress:  ip,
@@ -94,7 +148,11 @@ func (r *BannedIPStatsRepository) GetStats(ctx context.Context, ip string, windo
 
 	var country, countryCode sql.NullString
 	var hostsJSON, urisJSON []byte
-	err := r.db.QueryRowContext(ctx, bannedIPTrafficQuery, ip, windowDays).Scan(
+	query, args := bannedIPTrafficQuery, []interface{}{ip, windowDays}
+	if dialect.IsMySQL() {
+		query, args = dialect.Raw(mysqlBannedIPTrafficQuery), []interface{}{ip, windowDays, windowDays + 1}
+	}
+	err := r.db.QueryRowContext(ctx, query, args...).Scan(
 		&stats.TotalRequests, &stats.BlockedRequests, &stats.FirstSeen, &stats.LastSeen,
 		&country, &countryCode, &hostsJSON, &urisJSON,
 	)
@@ -112,6 +170,11 @@ func (r *BannedIPStatsRepository) GetStats(ctx context.Context, ip string, windo
 	}
 	if err := unmarshalTargets(urisJSON, &stats.TopURIs); err != nil {
 		return nil, err
+	}
+	if dialect.IsMySQL() {
+		for _, list := range []*[]model.BannedIPTarget{&stats.TopHosts, &stats.TopURIs} {
+			sort.SliceStable(*list, func(i, j int) bool { return (*list)[i].Count > (*list)[j].Count })
+		}
 	}
 
 	// Ban history is deliberately not windowed — the whole point of the number

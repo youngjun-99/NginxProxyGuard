@@ -8,6 +8,7 @@ import (
 
 	"github.com/lib/pq"
 
+	"nginx-proxy-guard/internal/database/dialect"
 	"nginx-proxy-guard/internal/model"
 )
 
@@ -157,7 +158,7 @@ func (r *AuthRepository) UpdateUserCredentials(ctx context.Context, userID, user
 func (r *AuthRepository) UpdateUserEmail(ctx context.Context, userID, email string) error {
 	_, err := r.db.ExecContext(ctx, `
 		UPDATE users SET email = $2, updated_at = NOW() WHERE id = $1`, userID, email)
-	if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+	if dialect.IsUniqueViolation(err) {
 		return ErrEmailTaken
 	}
 	return err

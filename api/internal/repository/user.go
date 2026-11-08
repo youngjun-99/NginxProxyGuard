@@ -10,6 +10,7 @@ import (
 	"github.com/lib/pq"
 
 	"nginx-proxy-guard/internal/database"
+	"nginx-proxy-guard/internal/database/dialect"
 	"nginx-proxy-guard/internal/model"
 )
 
@@ -83,8 +84,8 @@ func (r *UserRepository) Create(ctx context.Context, username, email, passwordHa
 	if err != nil {
 		// Both columns are unique, and the caller now supplies both — say which
 		// one collided rather than blaming the username for an email clash.
-		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
-			if strings.Contains(pqErr.Constraint, "email") {
+		if dialect.IsUniqueViolation(err) {
+			if strings.Contains(dialect.ViolatedConstraint(err), "email") {
 				return "", ErrEmailTaken
 			}
 			return "", fmt.Errorf("username already exists")
@@ -115,7 +116,7 @@ func (r *UserRepository) CreateFederated(ctx context.Context, username, email, p
 		RETURNING id`,
 		email, username, passwordHash, legacyRole, roleID).Scan(&id)
 	if err != nil {
-		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+		if dialect.IsUniqueViolation(err) {
 			return "", fmt.Errorf("an account with this username or email already exists")
 		}
 		return "", fmt.Errorf("failed to create federated user: %w", err)
@@ -163,7 +164,7 @@ func (r *UserRepository) SetEmail(ctx context.Context, userID, email string) err
 		UPDATE users SET email = $2, updated_at = now()
 		WHERE id = $1`, userID, email)
 	if err != nil {
-		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+		if dialect.IsUniqueViolation(err) {
 			return ErrEmailTaken
 		}
 		return fmt.Errorf("failed to set email: %w", err)
@@ -266,7 +267,8 @@ func (r *UserRepository) GetDetail(ctx context.Context, userID string) (*model.U
 	// install whose upgrade failed must still be able to open a user's detail.
 	var ssoPresent bool
 	if err := r.db.QueryRowContext(ctx,
-		`SELECT to_regclass('public.user_identities') IS NOT NULL`).Scan(&ssoPresent); err == nil && ssoPresent {
+		//npg:pg-only: tablesExistQuery swaps in the MySQL form
+		tablesExistQuery(`SELECT to_regclass('public.user_identities') IS NOT NULL`, "user_identities")).Scan(&ssoPresent); err == nil && ssoPresent {
 		idRows, err := r.db.QueryContext(ctx, `
 			SELECT p.name, p.slug, COALESCE(i.email, ''), i.last_login_at, i.created_at
 			FROM user_identities i

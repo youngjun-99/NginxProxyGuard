@@ -164,7 +164,7 @@ Cloudflare나 다른 프록시 뒤에서 운영한다면 설정 → 신뢰 프�
 | 기술 | 용도 |
 |------|------|
 | **Nginx 1.30.4** | HTTP/3 & QUIC을 지원하는 고성능 HTTP 및 stream 리버스 프록시 코어 |
-| **TimescaleDB (PostgreSQL 17)** | 로그 자동 압축을 위한 시계열 최적화 데이터베이스 |
+| **TimescaleDB (PostgreSQL 17)** _또는_ **MySQL 8.4** | 로그 자동 압축을 위한 시계열 최적화 데이터베이스. MySQL도 대안으로 지원합니다 ([MySQL로 실행하기](#mysql로-실행하기-선택) 참고) |
 | **Valkey 9** | Redis 호환 고속 캐싱 및 세션 관리 (선택) |
 | **Go 1.26 (Echo v4)** | 효율적인 리소스 관리와 동시성 처리 백엔드 API |
 | **React 19 & TypeScript 6** | 타입 안전성과 컴포넌트 기반의 모던 UI (Vite 8 + Tailwind 4) |
@@ -200,6 +200,26 @@ sed -i "s/JWT_SECRET=.*/JWT_SECRET=$(openssl rand -hex 32)/" .env
 # 4. 서비스 시작
 docker compose up -d
 ```
+
+### MySQL로 실행하기 (선택)
+
+기본이자 권장 엔진은 지금처럼 TimescaleDB/PostgreSQL입니다. 이미 MySQL을 운영 중이거나 PostgreSQL을 따로 두고 싶지 않은 환경을 위해 **MySQL 8.4 LTS**(8.0.17 이상)에서도 동작합니다. `docker-compose.yml` 옆에 오버레이 파일을 받아 두 파일을 함께 띄우면 됩니다.
+
+```bash
+wget https://raw.githubusercontent.com/svrforum/nginxproxyguard/main/docker-compose.mysql.yml
+# MySQL 이미지는 DB_USER로 "root"를 쓸 수 없습니다. 오버레이 기본값은 "npg"입니다.
+sed -i "s/^DB_USER=.*/DB_USER=npg/" .env
+echo "COMPOSE_FILE=docker-compose.yml:docker-compose.mysql.yml" >> .env
+docker compose up -d
+```
+
+기존 MySQL 서버를 쓰려면 `CREATE DATABASE nginx_proxy_guard CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;`으로 데이터베이스를 만들고 `api` 서비스에 `DATABASE_URL=mysql://user:password@host:3306/nginx_proxy_guard`를 지정하세요. 스키마 생성과 업그레이드는 PostgreSQL과 마찬가지로 기동 시 자동으로 적용됩니다.
+
+MySQL에서 달라지는 점:
+
+- **TimescaleDB 기능은 없습니다.** 로그 압축, 원본 로그 정리 작업(설정 › 유지보수, "사용 불가"로 표시), DiskGuard의 긴급 압축은 PostgreSQL 전용입니다. 디스크 사용량 알림은 그대로 동작합니다. 로그 보존 기간이 지난 행은 청크 삭제 대신 배치 단위 DELETE로 지웁니다.
+- **로그 텍스트 검색은 스캔합니다.** URI·User-Agent의 `%부분문자열%` 필터를 PostgreSQL은 pg_trgm 인덱스로 처리하지만 MySQL에는 대응물이 없어, 선택한 기간 범위를 스캔합니다.
+- **엔진은 설치할 때 한 번 정합니다.** 엔진 간 제자리 마이그레이션은 없습니다. 바꾸려면 다른 엔진으로 새로 설치한 뒤 NPG 백업(설정 › 백업)을 복원하세요. 백업은 API가 직접 내보내므로 엔진과 무관합니다.
 
 ### 접속
 
@@ -297,11 +317,13 @@ https://localhost:81/api/docs
 
 | 변수 | 설명 | 기본값 |
 |------|------|--------|
-| `DB_PASSWORD` | PostgreSQL 비밀번호 | (필수) |
+| `DB_PASSWORD` | 데이터베이스 비밀번호 | (필수) |
 | `JWT_SECRET` | 애플리케이션 시크릿 — 무작위 값으로 설정 (`openssl rand -hex 32`) | `docker-compose.yml` 플레이스홀더 (변경 필요) |
 | `TZ` | 시간대 | `UTC` |
-| `DB_USER` | PostgreSQL 사용자 | `postgres` |
+| `DB_USER` | 데이터베이스 사용자 (MySQL에서는 `root` 불가) | `postgres` (MySQL 오버레이는 `npg`) |
 | `DB_NAME` | 데이터베이스 이름 | `nginx_proxy_guard` |
+| `DATABASE_URL` | 전체 접속 URL. `postgres://…` 또는 `mysql://…` 스킴으로 엔진을 고릅니다 | 위 변수들로 구성 |
+| `DB_ROOT_PASSWORD` / `MYSQL_BUFFER_POOL` | MySQL 오버레이 전용: root 비밀번호와 InnoDB 버퍼 풀 크기 | `DB_PASSWORD` / `512M` |
 | `DOCKER_API_VERSION` | Docker API 버전 (시놀로지용) | 자동 감지 |
 | `UI_PORT` | 관리 패널 호스트 포트 | `81` |
 | `NGINX_HTTP_PORT` / `NGINX_HTTPS_PORT` | nginx 리슨 포트 (host 네트워크 모드; 80/443이 이미 사용 중일 때 변경, 예: Synology DSM) | `80` / `443` |

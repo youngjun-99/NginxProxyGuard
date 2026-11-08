@@ -8,6 +8,7 @@ import (
 
 	"github.com/lib/pq"
 
+	"nginx-proxy-guard/internal/database/dialect"
 	"nginx-proxy-guard/internal/model"
 )
 
@@ -76,8 +77,7 @@ func (r *LogRulesRepository) List(ctx context.Context) ([]model.HostLogRulesEntr
 // Get returns a proxy host with its rules, nil when there is no such host.
 func (r *LogRulesRepository) Get(ctx context.Context, proxyHostID string) (*model.HostLogRulesEntry, error) {
 	e, err := scanLogRulesEntry(r.db.QueryRowContext(ctx, logRulesHostSelect+` AND h.id = $1`, proxyHostID))
-	var pqErr *pq.Error
-	if errors.Is(err, sql.ErrNoRows) || errors.As(err, &pqErr) && pqErr.Code == "22P02" {
+	if errors.Is(err, sql.ErrNoRows) || dialect.SQLState(err) == dialect.SQLStateInvalidTextRepresentation {
 		// No such host, or an id that is no uuid.
 		return nil, nil
 	}
@@ -111,8 +111,7 @@ func (r *LogRulesRepository) Set(ctx context.Context, proxyHostID string, rules 
 			skip_paths = EXCLUDED.skip_paths,
 			updated_at = NOW()`,
 		proxyHostID, rules.SkipAll, pq.Array(nonNil(rules.SkipStatuses)), pq.Array(nonNil(rules.SkipMethods)), pq.Array(nonNil(rules.SkipPaths)))
-	var pqErr *pq.Error
-	if errors.As(err, &pqErr) && pqErr.Code == "23503" {
+	if dialect.IsForeignKeyViolation(err) {
 		// The host was deleted since Get read it.
 		return nil, nil
 	}

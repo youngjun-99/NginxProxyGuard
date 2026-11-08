@@ -7,6 +7,7 @@ import (
 	"net"
 	"strings"
 
+	"nginx-proxy-guard/internal/database/dialect"
 	"nginx-proxy-guard/internal/model"
 )
 
@@ -50,6 +51,12 @@ func startsMatchingAsGeo(entry string) bool {
 // (startsMatchingAsGeo), so the operator can check that the clients it names
 // should be let through.
 func WarnIPListMatchingChangeOnce(ctx context.Context, db *sql.DB) {
+	// The notice is about entries written before v2.62.0 changed how they
+	// match. A MySQL install starts on a release long past that, so there is
+	// nothing to warn about (and the scan's unnest has no MySQL form).
+	if dialect.IsMySQL() {
+		return
+	}
 	var given bool
 	if err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)`, ipListGeoMarker).Scan(&given); err != nil {
 		log.Printf("[WARN] [Startup] could not check whether the IP list notice was given: %v", err)
@@ -58,6 +65,7 @@ func WarnIPListMatchingChangeOnce(ctx context.Context, db *sql.DB) {
 	if given {
 		return
 	}
+	//npg:pg-only
 	rows, err := db.QueryContext(ctx, `
 		SELECT 'host ' || COALESCE(ph.domain_names[1], g.proxy_host_id::text), 'priority allow', ip
 		  FROM geo_restrictions g LEFT JOIN proxy_hosts ph ON ph.id = g.proxy_host_id, unnest(g.allowed_ips) AS ip

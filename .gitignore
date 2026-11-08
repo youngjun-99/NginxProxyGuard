@@ -59,6 +59,8 @@ temp/
 # Database
 *.sql
 !api/internal/database/migrations/*.sql
+# The MySQL schema rendered from the PostgreSQL one, checked in for review.
+!api/internal/database/mysqlschema/testdata/*.sql
 
 # Backups
 backups/

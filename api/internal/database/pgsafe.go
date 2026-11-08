@@ -1,6 +1,10 @@
 package database
 
-import "strings"
+import (
+	"strings"
+
+	"nginx-proxy-guard/internal/database/dialect"
+)
 
 // Postgres driver text, and what replaces it.
 //
@@ -58,17 +62,30 @@ const (
 //
 // A message with no driver text in it is returned untouched, so this is safe to
 // call unconditionally on any path, whatever the error turns out to be.
+//
+// On MySQL the boundary is go-sql-driver's "Error <number> (<SQLSTATE>): "
+// (or the translator's refusal), and the reason comes from the MySQL error
+// number, mapped onto the same two SQLSTATEs.
 func ScrubDriverText(message string) string {
-	i := strings.Index(message, DriverTextPrefix)
+	i := driverTextStart(message)
 	if i < 0 {
 		return message
 	}
 
 	reason := MsgDatabaseError
-	if strings.Contains(message[i:], "("+SQLStateInvalidTextRepresentation+")") {
-		reason = MsgInvalidIdentifier
-	} else if strings.Contains(message[i:], "("+SQLStateStringDataRightTruncation+")") {
-		reason = MsgValueTooLong
+	if strings.HasPrefix(message[i:], DriverTextPrefix) {
+		if strings.Contains(message[i:], "("+SQLStateInvalidTextRepresentation+")") {
+			reason = MsgInvalidIdentifier
+		} else if strings.Contains(message[i:], "("+SQLStateStringDataRightTruncation+")") {
+			reason = MsgValueTooLong
+		}
+	} else {
+		switch dialect.DriverTextSQLState(message[i:]) {
+		case SQLStateInvalidTextRepresentation:
+			reason = MsgInvalidIdentifier
+		case SQLStateStringDataRightTruncation:
+			reason = MsgValueTooLong
+		}
 	}
 
 	prefix := strings.TrimRight(message[:i], " \t:,-")
@@ -77,3 +94,26 @@ func ScrubDriverText(message string) string {
 	}
 	return prefix + ": " + reason
 }
+
+// driverTextStart is where driver-written text begins in message, or -1.
+//
+// On PostgreSQL that is lib/pq's "pq: " and nothing else, exactly as it has
+// always been. On MySQL it is also go-sql-driver's "Error <number>
+// (<SQLSTATE>): " and the translator's refusal of a statement, whichever comes
+// first. The MySQL shapes are only looked for on MySQL: "Error 1015: ..." is
+// also how some upstream APIs word their own errors, and on PostgreSQL that
+// text is never ours to cut.
+func driverTextStart(message string) int {
+	if !dialect.IsMySQL() {
+		return strings.Index(message, DriverTextPrefix)
+	}
+	i := dialect.DriverTextIndex(message)
+	if j := strings.Index(message, dialect.ErrUntranslatable.Error()); j >= 0 && (i < 0 || j < i) {
+		i = j
+	}
+	return i
+}
+
+// HasDriverText reports whether message contains driver-written text, by the
+// same rule ScrubDriverText cuts at.
+func HasDriverText(message string) bool { return driverTextStart(message) >= 0 }

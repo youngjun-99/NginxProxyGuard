@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"nginx-proxy-guard/internal/database/dialect"
 )
 
 // averagedRequestFilter picks the requests an average response time is taken
@@ -45,6 +47,8 @@ const averagedRequestFilter = `status_code IS DISTINCT FROM 101 AND request_time
 // a WAF block's own access row seldom says 'waf', so counting WAF blocks
 // among access rows always gave 0 (#369). An hour with WAF blocks and no
 // access rows (access logging off) still gets its row.
+//
+//npg:pg-only
 const hourlyRollupRecomputeSQL = `
 WITH hours AS (
     SELECT generate_series(date_trunc('hour', $1::timestamptz, 'UTC'),
@@ -120,6 +124,8 @@ ON CONFLICT (hour_bucket) WHERE proxy_host_id IS NULL DO UPDATE SET
 // Host rows count no WAF blocks: those are modsec rows, which carry no
 // proxy_host_id. GET /dashboard/stats/hourly with a proxy_host_id reads host
 // rows, so its waf_blocked stays 0, as it always was.
+//
+//npg:pg-only
 const hourlyHostRollupSQL = `
 WITH agg AS (
     SELECT l.proxy_host_id, date_trunc('hour', l.created_at, 'UTC') AS hour_bucket,
@@ -170,6 +176,8 @@ ON CONFLICT (proxy_host_id, hour_bucket) DO UPDATE SET
 // A correlated raw-log probe per hourly row repeatedly builds index bitmaps
 // on busy installations, even when there are no stale rows to delete.
 // A separate DELETE still runs when no host traffic survives a replay.
+//
+//npg:pg-only
 const hourlyHostRollupCleanupSQL = `WITH active AS MATERIALIZED (
     SELECT proxy_host_id, date_trunc('hour', created_at, 'UTC') AS hour_bucket
     FROM logs_partitioned
@@ -199,6 +207,9 @@ WHERE d.proxy_host_id IS NOT NULL
 // repair anything after a restart. A recompute is exact for whatever the logs
 // hold, whichever path wrote them.
 func (r *DashboardRepository) RecomputeHourlyRollup(ctx context.Context, from, to time.Time) (int64, error) {
+	if dialect.IsMySQL() {
+		return r.recomputeHourlyRollupMySQL(ctx, from, to)
+	}
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err

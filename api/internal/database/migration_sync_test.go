@@ -98,9 +98,9 @@ func mustReadFile(t *testing.T, path string) string {
 	return string(b)
 }
 
-// mustExtractUpgradeSliceSQL parses migration.go and returns the slice of SQL
-// strings from the `upgrades` local in RunMigrations. Each element's `sql` field
-// is extracted from the AST.
+// mustExtractUpgradeSliceSQL parses migration.go and returns the SQL strings
+// of the upgrade list: the slice literal postgresUpgrades returns. Each
+// element's `sql` field is extracted from the AST.
 func mustExtractUpgradeSliceSQL(t *testing.T, fileName string) []string {
 	t.Helper()
 	src := mustReadFile(t, fileName)
@@ -112,23 +112,16 @@ func mustExtractUpgradeSliceSQL(t *testing.T, fileName string) []string {
 	var sqls []string
 	ast.Inspect(f, func(n ast.Node) bool {
 		fn, ok := n.(*ast.FuncDecl)
-		if !ok || fn.Name == nil || fn.Name.Name != "RunMigrations" {
+		if !ok || fn.Name == nil || fn.Name.Name != "postgresUpgrades" {
 			return true
 		}
-		// Inside RunMigrations: find AssignStmt with LHS "upgrades" and RHS slice literal.
+		// Inside postgresUpgrades: the returned slice literal.
 		ast.Inspect(fn.Body, func(n2 ast.Node) bool {
-			as, ok := n2.(*ast.AssignStmt)
-			if !ok || len(as.Lhs) != 1 {
+			ret, ok := n2.(*ast.ReturnStmt)
+			if !ok || len(ret.Results) != 1 {
 				return true
 			}
-			id, ok := as.Lhs[0].(*ast.Ident)
-			if !ok || id.Name != "upgrades" {
-				return true
-			}
-			if len(as.Rhs) != 1 {
-				return true
-			}
-			cl, ok := as.Rhs[0].(*ast.CompositeLit)
+			cl, ok := ret.Results[0].(*ast.CompositeLit)
 			if !ok {
 				return true
 			}
@@ -163,7 +156,7 @@ func mustExtractUpgradeSliceSQL(t *testing.T, fileName string) []string {
 		return false
 	})
 	if len(sqls) == 0 {
-		t.Fatalf("no SQL statements extracted from upgrades slice in %s; the AST extraction logic is out of sync with the code structure", fileName)
+		t.Fatalf("no SQL statements extracted from the postgresUpgrades slice in %s; the AST extraction logic is out of sync with the code structure", fileName)
 	}
 	return sqls
 }

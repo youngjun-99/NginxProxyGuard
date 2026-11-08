@@ -123,7 +123,13 @@ func initDiskGuard(cfg *config.Config, db *database.DB, repos *Repositories, svc
 	// Stopping the scheduler cancels this, which also ends an emergency pass
 	// in flight: the chunk being compressed rolls back cleanly (verified).
 	svcs.diskGuardCtx, svcs.diskGuardCancel = context.WithCancel(context.Background())
-	emerg := service.NewEmergencyCompressor(svcs.diskGuardCtx, maint, provider.MeasureDB, diskEmergencyMode())
+	mode := diskEmergencyMode()
+	if db.IsMySQL() {
+		// Emergency compression compresses TimescaleDB chunks; a MySQL
+		// database has none. Disk alerts still run.
+		mode = service.EmergencyOff
+	}
+	emerg := service.NewEmergencyCompressor(svcs.diskGuardCtx, maint, provider.MeasureDB, mode)
 	emerg.SetSystemLog(func(level repository.SystemLogLevel, msg string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

@@ -9,9 +9,8 @@ import (
 	"log"
 	"time"
 
-	"github.com/lib/pq"
-
 	"nginx-proxy-guard/internal/database"
+	"nginx-proxy-guard/internal/database/dialect"
 )
 
 // StorageMaintenanceRepository holds the SQL behind DiskGuard's handling of
@@ -30,9 +29,18 @@ func NewStorageMaintenanceRepository(db *sql.DB) *StorageMaintenanceRepository {
 // DataDirectory is SHOW data_directory: where the database container keeps
 // its files, which DiskGuard measures through docker exec. It needs superuser
 // or pg_read_all_settings; callers fall back to the image default.
+//
+// On MySQL it is @@datadir, which any account may read. MySQL reports it with
+// a trailing slash ("/var/lib/mysql/"), which the caller's path check refuses
+// as unclean, so the slash is cut.
 func (r *StorageMaintenanceRepository) DataDirectory(ctx context.Context) (string, error) {
+	//npg:pg-only
+	query := `SELECT current_setting('data_directory')`
+	if dialect.IsMySQL() {
+		query = dialect.Raw(`SELECT TRIM(TRAILING '/' FROM @@datadir)`)
+	}
 	var dir string
-	err := r.db.QueryRowContext(ctx, `SELECT current_setting('data_directory')`).Scan(&dir)
+	err := r.db.QueryRowContext(ctx, query).Scan(&dir)
 	return dir, err
 }
 
@@ -145,13 +153,9 @@ func IsLockTimeout(err error) bool { return sqlStateOf(err) == "55P03" }
 // cleanly, removes its partial output and leaves the chunk uncompressed.
 func IsDiskFull(err error) bool { return sqlStateOf(err) == "53100" }
 
-func sqlStateOf(err error) string {
-	var pqErr *pq.Error
-	if errors.As(err, &pqErr) {
-		return string(pqErr.Code)
-	}
-	return ""
-}
+// sqlStateOf is the error's PostgreSQL SQLSTATE; on MySQL the codes the
+// callers test for are mapped onto it (dialect.SQLState).
+func sqlStateOf(err error) string { return dialect.SQLState(err) }
 
 // ── emergency compression (D3) ─────────────────────────────────────────────
 
@@ -172,6 +176,7 @@ type ChunkCandidate struct {
 // containing now() is the only one still being written, and it is never
 // returned.
 func (r *StorageMaintenanceRepository) CompressionCandidates(ctx context.Context, minBytes int64) ([]ChunkCandidate, error) {
+	//npg:pg-only: TimescaleDB-only; never reached on MySQL (DiskGuard emergency mode is off)
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT c.hypertable_name, c.chunk_schema, c.chunk_name, c.range_start, c.range_end,
 		       pg_total_relation_size(format('%I.%I', c.chunk_schema, c.chunk_name)::regclass)
@@ -202,6 +207,7 @@ func (r *StorageMaintenanceRepository) CompressionCandidates(ctx context.Context
 // compressed. A hypertable with nothing compressed yet is absent; the caller
 // uses its floor.
 func (r *StorageMaintenanceRepository) CompressionRatios(ctx context.Context) (map[string]float64, error) {
+	//npg:pg-only: TimescaleDB-only; never reached on MySQL (DiskGuard emergency mode is off)
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT h.hypertable_name, s.before_compression_total_bytes, s.after_compression_total_bytes
 		FROM timescaledb_information.hypertables h
@@ -230,6 +236,7 @@ func (r *StorageMaintenanceRepository) CompressionRatios(ctx context.Context) (m
 // 'Running' (and pg_stat_activity shows "Columnstore Policy [<job_id>]").
 func (r *StorageMaintenanceRepository) CompressionPolicyRunning(ctx context.Context) (bool, error) {
 	var running bool
+	//npg:pg-only: TimescaleDB-only; never reached on MySQL (DiskGuard emergency mode is off)
 	err := r.db.QueryRowContext(ctx, `
 		SELECT EXISTS (
 		  SELECT 1 FROM timescaledb_information.job_stats s
@@ -267,6 +274,7 @@ func (c connCompressor) CompressChunk(ctx context.Context, schema, name string) 
 	}
 	var out sql.NullString
 	if err := tx.QueryRowContext(ctx,
+		//npg:pg-only: TimescaleDB-only; never reached on MySQL (DiskGuard emergency mode is off)
 		`SELECT compress_chunk(format('%I.%I', $1::text, $2::text)::regclass, if_not_compressed => true)::text`,
 		schema, name).Scan(&out); err != nil {
 		return err

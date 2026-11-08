@@ -18,6 +18,13 @@ var migrationFS embed.FS
 // 001_init.sql runs only once (on fresh install)
 // Upgrade statements run every time for existing installations
 func (db *DB) RunMigrations() error {
+	// MySQL derives its schema from these PostgreSQL files and has no
+	// TimescaleDB history to repair; see migration_mysql.go. Everything below
+	// is PostgreSQL only.
+	if db.IsMySQL() {
+		return db.runMySQLMigrations()
+	}
+
 	// Create migrations tracking table (for version tracking only)
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -76,10 +83,1451 @@ func (db *DB) RunMigrations() error {
 	// upgradeSQL with this structured slice. Every new upgrade statement belongs
 	// here; NEVER reintroduce a multi-statement Exec.
 	// ===========================================================================
-	upgrades := []struct {
-		desc string
-		sql  string
+	upgrades := postgresUpgrades()
+	for _, a := range upgrades {
+		if _, err := db.Exec(a.sql); err != nil {
+			// Warn-and-continue is deliberate (see the header comment above —
+			// a fail-fast boot would brick existing installs; statements are
+			// idempotent and retried next boot). Record the failure so
+			// MigrationHealth() can surface the partially-migrated schema
+			// instead of health staying silently green.
+			log.Printf("Warning: upgrade %q failed: %v", a.desc, err)
+			db.RecordMigrationFailure(a.desc, err)
+		}
+	}
+	if count, lastErr := db.MigrationHealth(); count > 0 {
+		log.Printf("[Migration] ERROR: %d upgrade statement(s) failed — schema may be partially migrated and affected features can return errors until a restart retries them. Last failure: %s", count, lastErr)
+	}
+
+	// v2.13.3: one-shot auto-disable for overly-broad system rules (Issue #123).
+	// Runs as an INDEPENDENT db.Exec so a prior failure in upgradeSQL (e.g. a
+	// stale TimescaleDB chunk error that aborts the implicit transaction) cannot
+	// silently skip the fix. v2.13.2 placed this DO block inside upgradeSQL and
+	// the implicit-transaction abort left the three rules enabled on affected
+	// installations. The helper is idempotent — it only updates rows where
+	// auto_disabled_at IS NULL AND enabled = true, so admins who have already
+	// re-enabled are not touched and repeat boots are no-ops.
+	if err := ApplyExploitRulesAutoDisable(db.DB); err != nil {
+		log.Printf("Warning: exploit rules auto-disable migration failed: %v", err)
+	}
+
+	// Run 006_fix_numeric_overflow migration for existing installations (Issue #29 fix)
+	if err := db.runNumericOverflowMigration(); err != nil {
+		log.Printf("Warning: numeric overflow migration had issues: %v", err)
+	}
+
+	// Run 008_fix_partition_timezone_v2 migration (fixes timezone detection bug in 007)
+	if err := db.runPartitionTimezoneMigration(); err != nil {
+		log.Printf("Warning: partition timezone migration had issues: %v", err)
+	}
+
+	// Run 009_pregenerate_partitions migration (pre-generates 10 years of partitions)
+	if err := db.runPregeneratePartitionsMigration(); err != nil {
+		log.Printf("Warning: partition pre-generation migration had issues: %v", err)
+	}
+
+	// Run 010_fix_hypertable_numeric migration (fixes numeric type after TimescaleDB migration, Issue #55)
+	if err := db.runHypertableNumericFixMigration(); err != nil {
+		log.Printf("Warning: hypertable numeric fix migration had issues: %v", err)
+	}
+
+	// Add pg_trgm GIN indexes for ILIKE search performance on logs
+	if err := db.runTrgmIndexMigration(); err != nil {
+		log.Printf("Warning: pg_trgm index migration had issues: %v", err)
+	}
+
+	// Migrate logs table to logs_partitioned in background (for existing installations).
+	// This allows API to start immediately while migration runs. Each migration
+	// derives its timeout from db.BackgroundContext() so a SIGTERM during
+	// migration cancels it instead of letting it run for ~30 minutes after
+	// the process is supposed to be shutting down (Issue: orphan goroutine
+	// risk on container restart).
+	db.TrackBackground()
+	go func() {
+		defer db.BackgroundDone()
+		ctx, cancel := context.WithTimeout(db.BackgroundContext(), 30*time.Minute)
+		defer cancel()
+		_ = ctx // wired through Close() via BackgroundContext cancellation
+		db.migrateLogsToPartitioned()
+	}()
+
+	// Migrate to TimescaleDB hypertable in background (for existing installations)
+	db.TrackBackground()
+	go func() {
+		defer db.BackgroundDone()
+		ctx, cancel := context.WithTimeout(db.BackgroundContext(), 30*time.Minute)
+		defer cancel()
+		_ = ctx
+		db.migrateToTimescaleDB()
+	}()
+
+	// Migrate other log tables to hypertables
+	db.TrackBackground()
+	go func() {
+		defer db.BackgroundDone()
+		ctx, cancel := context.WithTimeout(db.BackgroundContext(), 30*time.Minute)
+		defer cancel()
+		_ = ctx
+		db.migrateLogTablesToHypertables()
+	}()
+
+	log.Println("Schema migration completed")
+	return nil
+}
+
+// enableTimescaleDB enables the TimescaleDB extension
+func (db *DB) enableTimescaleDB() error {
+	_, err := db.Exec(`CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE`)
+	if err != nil {
+		return err
+	}
+	log.Println("[TimescaleDB] Extension enabled successfully")
+	return nil
+}
+
+// isTimescaleDBAvailable checks if TimescaleDB extension is available
+func (db *DB) isTimescaleDBAvailable() bool {
+	var available bool
+	err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'timescaledb')`).Scan(&available)
+	return err == nil && available
+}
+
+// isHypertable checks if a table is already a TimescaleDB hypertable
+func (db *DB) isHypertable(tableName string) bool {
+	var isHyper bool
+	err := db.QueryRow(`
+		SELECT EXISTS(
+			SELECT 1 FROM timescaledb_information.hypertables
+			WHERE hypertable_name = $1
+		)
+	`, tableName).Scan(&isHyper)
+	return err == nil && isHyper
+}
+
+// migrateLogsToPartitioned migrates data from old logs table to logs_partitioned
+func (db *DB) migrateLogsToPartitioned() {
+	// Check if old logs table exists
+	var logsExists bool
+	err := db.QueryRow(`
+		SELECT EXISTS(
+			SELECT 1 FROM information_schema.tables
+			WHERE table_schema = 'public' AND table_name = 'logs'
+		)
+	`).Scan(&logsExists)
+	if err != nil || !logsExists {
+		return // No old logs table, nothing to migrate
+	}
+
+	// Check if there's data to migrate
+	var count int
+	err = db.QueryRow(`SELECT COUNT(*) FROM logs LIMIT 1`).Scan(&count)
+	if err != nil || count == 0 {
+		// No data, just drop the old table
+		log.Println("[Migration] Dropping empty logs table...")
+		db.Exec(`DROP TABLE IF EXISTS logs CASCADE`)
+		return
+	}
+
+	log.Printf("[Migration] Found old logs table with data, migrating to logs_partitioned...")
+
+	// Migrate in batches
+	batchSize := 50000
+	totalMigrated := 0
+
+	for {
+		result, err := db.Exec(`
+			WITH batch AS (
+				SELECT id FROM logs
+				WHERE NOT EXISTS (SELECT 1 FROM logs_partitioned lp WHERE lp.id = logs.id)
+				LIMIT $1
+			)
+			INSERT INTO logs_partitioned (
+				id, log_type, timestamp, host, client_ip,
+				request_method, request_uri, request_protocol, status_code,
+				body_bytes_sent, request_time, upstream_response_time,
+				upstream_addr, upstream_status,
+				http_referer, http_user_agent, http_x_forwarded_for,
+				severity, error_message,
+				rule_id, rule_message, rule_severity, rule_data, attack_type, action_taken,
+				proxy_host_id, raw_log, created_at,
+				geo_country, geo_country_code, geo_city, geo_asn, geo_org,
+				block_reason, bot_category, exploit_rule
+			)
+			SELECT
+				l.id, l.log_type, l.timestamp, l.host, l.client_ip,
+				l.request_method, l.request_uri, l.request_protocol, l.status_code,
+				l.body_bytes_sent, l.request_time, l.upstream_response_time,
+				l.upstream_addr, l.upstream_status,
+				l.http_referer, l.http_user_agent, l.http_x_forwarded_for,
+				l.severity, l.error_message,
+				l.rule_id, l.rule_message, l.rule_severity, l.rule_data, l.attack_type, l.action_taken,
+				l.proxy_host_id, l.raw_log, l.created_at,
+				l.geo_country, l.geo_country_code, l.geo_city, l.geo_asn, l.geo_org,
+				l.block_reason, l.bot_category, l.exploit_rule
+			FROM logs l
+			WHERE l.id IN (SELECT id FROM batch)
+		`, batchSize)
+
+		if err != nil {
+			log.Printf("[Migration] Error migrating logs batch: %v", err)
+			break
+		}
+
+		rowsAffected, _ := result.RowsAffected()
+		totalMigrated += int(rowsAffected)
+
+		if rowsAffected < int64(batchSize) {
+			break
+		}
+
+		log.Printf("[Migration] Migrated %d logs so far...", totalMigrated)
+	}
+
+	if totalMigrated > 0 {
+		log.Printf("[Migration] Migrated %d logs to logs_partitioned", totalMigrated)
+	}
+
+	// Drop old logs table
+	log.Println("[Migration] Dropping old logs table...")
+	_, err = db.Exec(`DROP TABLE IF EXISTS logs CASCADE`)
+	if err != nil {
+		log.Printf("[Migration] Warning: failed to drop old logs table: %v", err)
+	} else {
+		log.Println("[Migration] Old logs table dropped successfully")
+
+		// `DROP ... CASCADE` also drops dependent objects, which includes logs_unified
+		// if it was built from both `logs` and `logs_partitioned` during startup.
+		// Rebuild it immediately so live log queries don't hit "relation does not exist".
+		_, rebuildErr := db.Exec(`
+			DROP VIEW IF EXISTS public.logs_unified CASCADE;
+			CREATE VIEW public.logs_unified AS
+			 SELECT id, log_type, "timestamp", host, client_ip,
+			        geo_country, geo_country_code, geo_city, geo_asn, geo_org,
+			        request_method, request_uri, request_protocol, status_code,
+			        body_bytes_sent, request_time, upstream_response_time,
+			        http_referer, http_user_agent, http_x_forwarded_for,
+			        severity, error_message,
+			        rule_id, rule_message, rule_severity, rule_data,
+			        attack_type, action_taken,
+			        block_reason, bot_category,
+			        proxy_host_id, raw_log, created_at,
+			        upstream_addr, upstream_status
+			   FROM public.logs_partitioned
+		`)
+		if rebuildErr != nil {
+			log.Printf("[Migration] Warning: failed to rebuild logs_unified view after drop: %v", rebuildErr)
+		} else {
+			log.Println("[Migration] logs_unified view rebuilt (single-table form)")
+		}
+	}
+}
+
+// migrateToTimescaleDB converts logs_partitioned (PostgreSQL native PARTITION BY
+// RANGE table created by 001_init.sql) into a TimescaleDB hypertable. Runs once
+// per install: marked complete in schema_migrations as 'timescaledb_hypertable'.
+// Applies to both fresh installs and existing installations that pre-date the
+// hypertable conversion — fresh installs simply migrate zero rows.
+func (db *DB) migrateToTimescaleDB() {
+	// Wait a bit for other migrations to complete
+	time.Sleep(5 * time.Second)
+
+	// Check if TimescaleDB is available
+	if !db.isTimescaleDBAvailable() {
+		log.Println("[TimescaleDB] Extension not available, skipping migration")
+		return
+	}
+
+	// Check if already migrated
+	var migrated bool
+	err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 'timescaledb_hypertable')`).Scan(&migrated)
+	if err == nil && migrated {
+		log.Println("[TimescaleDB] Already migrated to hypertable")
+		// Still set up compression policy
+		db.setupTimescaleDBCompression()
+		return
+	}
+
+	// Check if logs_hypertable already exists (indicates in-progress or completed migration)
+	if db.isHypertable("logs_hypertable") {
+		log.Println("[TimescaleDB] Hypertable already exists")
+		db.setupTimescaleDBCompression()
+		// This branch returns without swapping/recording the marker, so the
+		// canonical index ensure (deferred by runTrgmIndexMigration when the
+		// marker is absent) would otherwise never run on these installs. Run it
+		// here so the trgm/search indexes still get built. (Already in a
+		// background goroutine — safe to run inline.)
+		db.ensureLogsPartitionedIndexes()
+		return
+	}
+
+	// Check if logs_partitioned exists and has data
+	var hasData bool
+	err = db.QueryRow(`
+		SELECT EXISTS(
+			SELECT 1 FROM information_schema.tables
+			WHERE table_schema = 'public' AND table_name = 'logs_partitioned'
+		)
+	`).Scan(&hasData)
+	if err != nil || !hasData {
+		log.Println("[TimescaleDB] No logs_partitioned table found, will create hypertable on fresh install")
+		return
+	}
+
+	log.Println("[TimescaleDB] Starting migration from partitioned table to hypertable...")
+	ctx := context.Background()
+
+	// Use transaction for safety
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("[TimescaleDB] Failed to begin transaction: %v", err)
+		return
+	}
+	defer tx.Rollback()
+
+	// Step 1: Create new hypertable with same structure
+	log.Println("[TimescaleDB] Creating hypertable structure...")
+	_, err = tx.Exec(`
+		CREATE TABLE IF NOT EXISTS logs_hypertable (
+			id uuid NOT NULL DEFAULT gen_random_uuid(),
+			log_type log_type NOT NULL,
+			timestamp timestamp with time zone NOT NULL DEFAULT now(),
+			host text,
+			client_ip inet,
+			request_method text,
+			request_uri text,
+			request_protocol text,
+			status_code integer,
+			body_bytes_sent bigint,
+			request_time double precision,
+			upstream_response_time double precision,
+			upstream_addr text,
+			upstream_status text,
+			http_referer text,
+			http_user_agent text,
+			http_x_forwarded_for text,
+			severity log_severity,
+			error_message text,
+			-- bigint, not integer: ModSecurity rule ids exceed int4 (2147483647),
+			-- 001_init.sql declares logs_partitioned.rule_id bigint, and this table
+			-- is renamed over it on fresh installs — a narrower type here would
+			-- stick forever, since ADD COLUMN IF NOT EXISTS never repairs a type (#297)
+			rule_id bigint,
+			rule_message text,
+			rule_severity text,
+			rule_data text,
+			attack_type text,
+			action_taken text,
+			proxy_host_id uuid,
+			raw_log text,
+			created_at timestamp with time zone NOT NULL DEFAULT now(),
+			geo_country text,
+			geo_country_code varchar(2),
+			geo_city text,
+			geo_asn text,
+			geo_org text,
+			block_reason block_reason DEFAULT 'none',
+			bot_category text,
+			exploit_rule varchar(50)
+		)
+	`)
+	if err != nil {
+		log.Printf("[TimescaleDB] Failed to create table structure: %v", err)
+		return
+	}
+
+	// Step 2: Convert to hypertable
+	log.Println("[TimescaleDB] Converting to hypertable...")
+	_, err = tx.Exec(`
+		SELECT create_hypertable(
+			'logs_hypertable',
+			by_range('created_at', INTERVAL '1 day'),
+			if_not_exists => TRUE
+		)
+	`)
+	if err != nil {
+		log.Printf("[TimescaleDB] Failed to create hypertable: %v", err)
+		return
+	}
+
+	if err = tx.Commit(); err != nil {
+		log.Printf("[TimescaleDB] Failed to commit hypertable creation: %v", err)
+		return
+	}
+
+	// Step 3: Migrate data in batches using cursor-based pagination (outside transaction for large data)
+	// Cursor-based pagination avoids O(n²) memory/CPU cost of OFFSET pagination
+	log.Println("[TimescaleDB] Migrating data from partitioned table...")
+	batchSize := 50000
+	totalMigrated := 0
+
+	// Get approximate count for progress reporting (use reltuples for large tables to avoid full scan)
+	var totalCount int64
+	db.QueryRow(`SELECT COALESCE(reltuples::bigint, 0) FROM pg_class WHERE relname = 'logs_partitioned'`).Scan(&totalCount)
+	if totalCount <= 0 {
+		// Fallback to exact count only if estimate is unavailable
+		db.QueryRow(`SELECT COUNT(*) FROM logs_partitioned`).Scan(&totalCount)
+	}
+	log.Printf("[TimescaleDB] Estimated logs to migrate: %d", totalCount)
+
+	// Anti-join pagination (matches migrateLogsToPartitioned). The previous
+	// cursor pagination (`WHERE created_at >= lastCreatedAt`) re-inserted
+	// rows that shared a `created_at` value with the last batch's tail,
+	// and logs_hypertable has no PK to deduplicate — yielding an unbounded
+	// migration loop on installs with bursty log timestamps. NOT EXISTS
+	// makes the loop converge to zero new rows.
+	for {
+		result, err := db.Exec(`
+			INSERT INTO logs_hypertable (
+				id, log_type, timestamp, host, client_ip, request_method, request_uri,
+				request_protocol, status_code, body_bytes_sent, request_time,
+				upstream_response_time, upstream_addr, upstream_status,
+				http_referer, http_user_agent, http_x_forwarded_for,
+				severity, error_message, rule_id, rule_message, rule_severity, rule_data,
+				attack_type, action_taken, proxy_host_id, raw_log, created_at,
+				geo_country, geo_country_code, geo_city, geo_asn, geo_org,
+				block_reason, bot_category, exploit_rule
+			)
+			SELECT
+				lp.id, lp.log_type, lp.timestamp, lp.host, lp.client_ip, lp.request_method, lp.request_uri,
+				lp.request_protocol, lp.status_code, lp.body_bytes_sent, lp.request_time,
+				lp.upstream_response_time, lp.upstream_addr, lp.upstream_status,
+				lp.http_referer, lp.http_user_agent, lp.http_x_forwarded_for,
+				lp.severity, lp.error_message, lp.rule_id, lp.rule_message, lp.rule_severity, lp.rule_data,
+				lp.attack_type, lp.action_taken, lp.proxy_host_id, lp.raw_log, lp.created_at,
+				lp.geo_country, lp.geo_country_code, lp.geo_city, lp.geo_asn, lp.geo_org,
+				lp.block_reason, lp.bot_category, lp.exploit_rule
+			FROM logs_partitioned lp
+			WHERE NOT EXISTS (
+				SELECT 1 FROM logs_hypertable lh WHERE lh.id = lp.id
+			)
+			ORDER BY lp.created_at
+			LIMIT $1
+		`, batchSize)
+
+		if err != nil {
+			log.Printf("[TimescaleDB] Error migrating batch: %v", err)
+			break
+		}
+
+		rowsAffected, _ := result.RowsAffected()
+		if rowsAffected == 0 {
+			break
+		}
+
+		totalMigrated += int(rowsAffected)
+
+		if totalCount > 0 {
+			progress := float64(totalMigrated) / float64(totalCount) * 100
+			log.Printf("[TimescaleDB] Migrated %d/%d logs (%.1f%%)...", totalMigrated, totalCount, progress)
+		} else {
+			log.Printf("[TimescaleDB] Migrated %d logs so far...", totalMigrated)
+		}
+
+		// Small delay to reduce load
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	log.Printf("[TimescaleDB] Migration complete: %d logs migrated", totalMigrated)
+
+	// Step 4: Create indexes on hypertable
+	log.Println("[TimescaleDB] Creating indexes...")
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_logs_ht_timestamp ON logs_hypertable (created_at DESC)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_logs_ht_host ON logs_hypertable (host)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_logs_ht_type_time ON logs_hypertable (log_type, created_at DESC)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_logs_ht_exploit ON logs_hypertable (exploit_rule) WHERE exploit_rule IS NOT NULL AND exploit_rule <> '-'`)
+
+	// Step 5: Swap tables (rename)
+	log.Println("[TimescaleDB] Swapping tables...")
+	tx2, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		log.Printf("[TimescaleDB] Failed to begin swap transaction: %v", err)
+		return
+	}
+	defer tx2.Rollback()
+
+	// Rename old table as backup
+	_, err = tx2.Exec(`ALTER TABLE logs_partitioned RENAME TO logs_partitioned_backup`)
+	if err != nil {
+		log.Printf("[TimescaleDB] Failed to rename old table: %v", err)
+		return
+	}
+
+	// Rename hypertable to logs_partitioned
+	_, err = tx2.Exec(`ALTER TABLE logs_hypertable RENAME TO logs_partitioned`)
+	if err != nil {
+		log.Printf("[TimescaleDB] Failed to rename hypertable: %v", err)
+		// Rollback the rename
+		tx2.Rollback()
+		db.Exec(`ALTER TABLE logs_partitioned_backup RENAME TO logs_partitioned`)
+		return
+	}
+
+	if err = tx2.Commit(); err != nil {
+		log.Printf("[TimescaleDB] Failed to commit table swap: %v", err)
+		return
+	}
+
+	// Mark migration as complete
+	db.Exec(`INSERT INTO schema_migrations (version) VALUES ('timescaledb_hypertable') ON CONFLICT DO NOTHING`)
+
+	log.Println("[TimescaleDB] Migration to hypertable completed successfully!")
+
+	// Set up compression
+	db.setupTimescaleDBCompression()
+
+	// Clean up backup table. On fresh installs the source carried no rows, so
+	// the backup has nothing worth keeping. Critically, its leftover indexes
+	// (idx_logs_part_*) live in the same schema namespace as the new
+	// logs_partitioned, which causes upgradeSQL's `CREATE INDEX IF NOT EXISTS`
+	// statements to silently skip on subsequent boots (the index name already
+	// exists, just on the wrong table). Dropping the empty backup frees those
+	// names so the supporting indexes get created on the live hypertable.
+	// On installs with real data, keep the backup so operators can verify the
+	// migration before dropping it manually.
+	if totalMigrated == 0 {
+		log.Println("[TimescaleDB] Source table was empty, dropping logs_partitioned_backup")
+		if _, err := db.Exec(`DROP TABLE IF EXISTS public.logs_partitioned_backup CASCADE`); err != nil {
+			log.Printf("[TimescaleDB] Warning: failed to drop empty backup: %v", err)
+		}
+	} else {
+		log.Println("[TimescaleDB] Backup table 'logs_partitioned_backup' kept for safety. Drop manually when verified.")
+	}
+
+	// Build the canonical index set on the NEW live hypertable. The swap left
+	// the original idx_logs_part_* names on the backup table, so without this
+	// the live table runs with only the four idx_logs_ht_* basics and every
+	// CREATE INDEX IF NOT EXISTS elsewhere silently no-ops on the squatted
+	// names. (Already in a background goroutine — safe to run inline.)
+	db.ensureLogsPartitionedIndexes()
+}
+
+// migrateLogTablesToHypertables migrates system_logs, challenge_logs, audit_logs to hypertables
+func (db *DB) migrateLogTablesToHypertables() {
+	// Wait for main migration to complete
+	time.Sleep(10 * time.Second)
+
+	if !db.isTimescaleDBAvailable() {
+		log.Println("[TimescaleDB] Extension not available, skipping log tables migration")
+		return
+	}
+
+	// Define log tables to migrate
+	logTables := []struct {
+		name      string
+		segmentBy string
 	}{
+		{"system_logs", "source, level"},
+		{"challenge_logs", "result"},
+		{"audit_logs", "action"},
+	}
+
+	for _, table := range logTables {
+		db.migrateTableToHypertable(table.name, table.segmentBy)
+	}
+}
+
+// migrateTableToHypertable converts a regular table to a TimescaleDB hypertable
+func (db *DB) migrateTableToHypertable(tableName, segmentBy string) {
+	migrationKey := fmt.Sprintf("timescaledb_%s", tableName)
+
+	// Check if already migrated
+	var migrated bool
+	err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, migrationKey).Scan(&migrated)
+	if err == nil && migrated {
+		log.Printf("[TimescaleDB] %s already migrated to hypertable", tableName)
+		db.setupTableCompression(tableName, segmentBy)
+		return
+	}
+
+	// Check if table exists
+	var tableExists bool
+	err = db.QueryRow(`
+		SELECT EXISTS(
+			SELECT 1 FROM information_schema.tables
+			WHERE table_schema = 'public' AND table_name = $1
+		)
+	`, tableName).Scan(&tableExists)
+	if err != nil || !tableExists {
+		log.Printf("[TimescaleDB] Table %s not found, skipping", tableName)
+		return
+	}
+
+	// Check if already a hypertable
+	if db.isHypertable(tableName) {
+		log.Printf("[TimescaleDB] %s is already a hypertable", tableName)
+		db.setupTableCompression(tableName, segmentBy)
+		db.Exec(`INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, migrationKey)
+		return
+	}
+
+	log.Printf("[TimescaleDB] Starting migration of %s to hypertable...", tableName)
+
+	// Get row count
+	var rowCount int64
+	db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM %s`, tableName)).Scan(&rowCount)
+	log.Printf("[TimescaleDB] %s has %d rows", tableName, rowCount)
+
+	// For tables with foreign keys, we need to handle them carefully
+	// Drop foreign key constraints temporarily
+	var fkConstraints []struct {
+		name       string
+		definition string
+	}
+	rows, err := db.Query(`
+		SELECT conname, pg_get_constraintdef(oid)
+		FROM pg_constraint
+		WHERE conrelid = $1::regclass AND contype = 'f'
+	`, tableName)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var name, def string
+			rows.Scan(&name, &def)
+			fkConstraints = append(fkConstraints, struct {
+				name       string
+				definition string
+			}{name, def})
+		}
+	}
+
+	// Drop primary key (will recreate with created_at)
+	db.Exec(fmt.Sprintf(`ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s_pkey`, tableName, tableName))
+
+	// Drop foreign keys temporarily
+	for _, fk := range fkConstraints {
+		log.Printf("[TimescaleDB] Dropping FK %s temporarily", fk.name)
+		db.Exec(fmt.Sprintf(`ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s`, tableName, fk.name))
+	}
+
+	// Convert to hypertable
+	_, err = db.Exec(fmt.Sprintf(`
+		SELECT create_hypertable(
+			'%s',
+			by_range('created_at', INTERVAL '1 day'),
+			migrate_data => true,
+			if_not_exists => true
+		)
+	`, tableName))
+	if err != nil {
+		log.Printf("[TimescaleDB] Failed to convert %s to hypertable: %v", tableName, err)
+		// Restore primary key
+		db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD PRIMARY KEY (id)`, tableName))
+		// Restore foreign keys
+		for _, fk := range fkConstraints {
+			db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD CONSTRAINT %s %s`, tableName, fk.name, fk.definition))
+		}
+		return
+	}
+
+	log.Printf("[TimescaleDB] %s converted to hypertable successfully", tableName)
+
+	// Recreate primary key with created_at (required for hypertables)
+	db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD PRIMARY KEY (id, created_at)`, tableName))
+
+	// Restore foreign keys
+	for _, fk := range fkConstraints {
+		log.Printf("[TimescaleDB] Restoring FK %s", fk.name)
+		_, err := db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD CONSTRAINT %s %s`, tableName, fk.name, fk.definition))
+		if err != nil {
+			log.Printf("[TimescaleDB] Warning: failed to restore FK %s: %v", fk.name, err)
+		}
+	}
+
+	// Mark as migrated
+	db.Exec(`INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, migrationKey)
+
+	// Setup compression
+	db.setupTableCompression(tableName, segmentBy)
+}
+
+// setupTableCompression sets up compression for a specific hypertable
+func (db *DB) setupTableCompression(tableName, segmentBy string) {
+	if !db.isHypertable(tableName) {
+		return
+	}
+
+	// Check if compression is already enabled
+	var compressionEnabled bool
+	db.QueryRow(`
+		SELECT compression_enabled
+		FROM timescaledb_information.hypertables
+		WHERE hypertable_name = $1
+	`, tableName).Scan(&compressionEnabled)
+
+	if compressionEnabled {
+		log.Printf("[TimescaleDB] Compression already enabled for %s", tableName)
+	} else {
+		log.Printf("[TimescaleDB] Setting up compression for %s...", tableName)
+
+		// Enable compression
+		_, err := db.Exec(fmt.Sprintf(`
+			ALTER TABLE %s SET (
+				timescaledb.compress,
+				timescaledb.compress_segmentby = '%s',
+				timescaledb.compress_orderby = 'created_at DESC'
+			)
+		`, tableName, segmentBy))
+		if err != nil {
+			log.Printf("[TimescaleDB] Warning: failed to enable compression for %s: %v", tableName, err)
+			return
+		}
+	}
+
+	// The policy is checked on every boot, not only when compression is first
+	// enabled. It used to be added only in that first pass, so a policy that
+	// was missing afterwards stayed missing and the table was never compressed
+	// again (a dev install: audit_logs, 50 chunks, none compressed). A policy
+	// added here runs straight away and compresses the backlog itself.
+	var jobID int
+	err := db.QueryRow(`
+		SELECT job_id FROM timescaledb_information.jobs
+		WHERE proc_name = 'policy_compression'
+		  AND hypertable_schema = 'public' AND hypertable_name = $1
+		LIMIT 1
+	`, tableName).Scan(&jobID)
+	switch {
+	case err == sql.ErrNoRows:
+		if _, err := db.Exec(fmt.Sprintf(`
+			SELECT add_compression_policy('%s', INTERVAL '7 days', if_not_exists => true)
+		`, tableName)); err != nil {
+			log.Printf("[TimescaleDB] Warning: failed to add compression policy for %s: %v", tableName, err)
+			return
+		}
+		log.Printf("[TimescaleDB] Compression policy added for %s (chunks older than 7 days)", tableName)
+	case err != nil:
+		log.Printf("[TimescaleDB] Warning: could not check the compression policy for %s: %v", tableName, err)
+	}
+
+	// The one-time sweep of existing chunks and the status line belong to the
+	// first enable only.
+	if compressionEnabled {
+		return
+	}
+
+	log.Printf("[TimescaleDB] Compression enabled for %s", tableName)
+
+	// Compress existing old chunks immediately
+	db.Exec(fmt.Sprintf(`SELECT compress_chunk(c) FROM show_chunks('%s', older_than => INTERVAL '7 days') c`, tableName))
+
+	// Show compression status
+	var compressedChunks, totalChunks int
+	err = db.QueryRow(`
+		SELECT
+			COUNT(*) FILTER (WHERE is_compressed) as compressed,
+			COUNT(*) as total
+		FROM timescaledb_information.chunks
+		WHERE hypertable_name = $1
+	`, tableName).Scan(&compressedChunks, &totalChunks)
+	if err == nil && totalChunks > 0 {
+		log.Printf("[TimescaleDB] %s compression status: %d/%d chunks compressed", tableName, compressedChunks, totalChunks)
+	}
+}
+
+// logsCompressAfterDefault is how old a logs_partitioned chunk gets before the
+// compression policy compresses it on a new install. It was 7 days, and an
+// uncompressed day is about ten times its compressed size (about 8 GB a day on
+// the busiest install), so the week of uncompressed chunks was what filled a
+// disk. Compressed days still answer the log screens: aggregating one measured
+// faster than an uncompressed day, and the newest-first list stops in the
+// newest chunk.
+const logsCompressAfterDefault = "1 day"
+
+// logsCompressionPolicy returns the logs_partitioned compression job and its
+// compress_after as stored, or job 0 when there is none.
+func (db *DB) logsCompressionPolicy() (int, string, error) {
+	var jobID int
+	var after string
+	err := db.QueryRow(`
+		SELECT job_id, COALESCE(config->>'compress_after', config->>'compress_created_before', '?')
+		FROM timescaledb_information.jobs
+		WHERE proc_name = 'policy_compression'
+		  AND hypertable_schema = 'public' AND hypertable_name = 'logs_partitioned'
+		ORDER BY job_id
+		LIMIT 1`).Scan(&jobID, &after)
+	if err == sql.ErrNoRows {
+		return 0, "", nil
+	}
+	return jobID, after, err
+}
+
+// setupTimescaleDBCompression sets up compression policy for the hypertable
+func (db *DB) setupTimescaleDBCompression() {
+	if !db.isTimescaleDBAvailable() {
+		return
+	}
+
+	// Check if logs_partitioned is a hypertable
+	if !db.isHypertable("logs_partitioned") {
+		log.Println("[TimescaleDB] logs_partitioned is not a hypertable, skipping compression setup")
+		return
+	}
+
+	log.Println("[TimescaleDB] Setting up compression policy...")
+
+	// Enable compression on the hypertable
+	_, err := db.Exec(`
+		ALTER TABLE logs_partitioned SET (
+			timescaledb.compress,
+			timescaledb.compress_segmentby = 'host, log_type',
+			timescaledb.compress_orderby = 'created_at DESC'
+		)
+	`)
+	if err != nil {
+		log.Printf("[TimescaleDB] Warning: failed to enable compression: %v", err)
+		return
+	}
+
+	// Add the policy only when there is none. add_compression_policy with
+	// if_not_exists does not change an existing policy: given other arguments
+	// it only warns ("A policy already exists with different arguments"), and
+	// it would do that on every boot of every install that kept 7 days or
+	// chose its own value. Existing installs are moved off the old 7-day
+	// default once, by the logs_compress_after_1d_v1 upgrade.
+	jobID, after, err := db.logsCompressionPolicy()
+	if err == nil && jobID == 0 {
+		_, err = db.Exec(`SELECT add_compression_policy('logs_partitioned', INTERVAL '` + logsCompressAfterDefault + `', if_not_exists => true)`)
+		if err == nil {
+			jobID, after, err = db.logsCompressionPolicy()
+		}
+	}
+	if err == nil && jobID == 0 {
+		err = fmt.Errorf("no compression job listed for logs_partitioned after adding one")
+	}
+	if err != nil {
+		log.Printf("[TimescaleDB] Warning: could not set up the logs compression policy: %v", err)
+		return
+	}
+
+	// Read back from the jobs view, so the line states what this install
+	// actually does rather than what the code would have chosen.
+	log.Printf("[TimescaleDB] Compression policy (job %d): chunks older than %s are compressed", jobID, after)
+
+	// Show current compression status
+	var compressedChunks, totalChunks int
+	err = db.QueryRow(`
+		SELECT
+			COUNT(*) FILTER (WHERE is_compressed) as compressed,
+			COUNT(*) as total
+		FROM timescaledb_information.chunks
+		WHERE hypertable_name = 'logs_partitioned'
+	`).Scan(&compressedChunks, &totalChunks)
+	if err == nil {
+		log.Printf("[TimescaleDB] Compression status: %d/%d chunks compressed", compressedChunks, totalChunks)
+	}
+}
+
+// runNumericOverflowMigration fixes the numeric field overflow issue (Issue #29)
+// This migration changes request_time and upstream_response_time from NUMERIC(10,6) to DOUBLE PRECISION
+func (db *DB) runNumericOverflowMigration() error {
+	const migrationVersion = "006_fix_numeric_overflow"
+
+	// Check if already migrated
+	var migrated bool
+	err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, migrationVersion).Scan(&migrated)
+	if err != nil {
+		return fmt.Errorf("failed to check migration status: %w", err)
+	}
+	if migrated {
+		log.Printf("[Migration] %s already applied", migrationVersion)
+		return nil
+	}
+
+	// Check if logs_partitioned table exists
+	var tableExists bool
+	err = db.QueryRow(`
+		SELECT EXISTS(
+			SELECT 1 FROM information_schema.tables
+			WHERE table_schema = 'public' AND table_name = 'logs_partitioned'
+		)
+	`).Scan(&tableExists)
+	if err != nil || !tableExists {
+		log.Printf("[Migration] logs_partitioned table not found, skipping %s", migrationVersion)
+		// Mark as applied since new installations already have DOUBLE PRECISION
+		db.Exec(`INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, migrationVersion)
+		return nil
+	}
+
+	// Check current column type
+	var dataType string
+	err = db.QueryRow(`
+		SELECT data_type
+		FROM information_schema.columns
+		WHERE table_schema = 'public' AND table_name = 'logs_partitioned' AND column_name = 'request_time'
+	`).Scan(&dataType)
+	if err != nil {
+		return fmt.Errorf("failed to check column type: %w", err)
+	}
+
+	// If already DOUBLE PRECISION, mark as migrated and skip
+	if dataType == "double precision" {
+		log.Printf("[Migration] request_time already uses double precision, marking %s as applied", migrationVersion)
+		db.Exec(`INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, migrationVersion)
+		return nil
+	}
+
+	log.Printf("[Migration] Starting %s: changing NUMERIC to DOUBLE PRECISION...", migrationVersion)
+	log.Printf("[Migration] Current request_time type: %s", dataType)
+
+	// Check if this is a TimescaleDB hypertable
+	isHypertable := db.isHypertable("logs_partitioned")
+
+	if isHypertable {
+		log.Println("[Migration] logs_partitioned is a TimescaleDB hypertable, handling compression...")
+
+		// Step 1: Decompress all chunks
+		log.Println("[Migration] Decompressing compressed chunks...")
+		_, err = db.Exec(`
+			DO $$
+			DECLARE
+				chunk_record RECORD;
+				decompressed_count INT := 0;
+			BEGIN
+				FOR chunk_record IN
+					SELECT format('%I.%I', chunk_schema, chunk_name) as full_name
+					FROM timescaledb_information.chunks
+					WHERE hypertable_name = 'logs_partitioned' AND is_compressed = true
+				LOOP
+					EXECUTE format('SELECT decompress_chunk(%L, true)', chunk_record.full_name);
+					decompressed_count := decompressed_count + 1;
+					RAISE NOTICE 'Decompressed: %', chunk_record.full_name;
+				END LOOP;
+				RAISE NOTICE 'Total chunks decompressed: %', decompressed_count;
+			END;
+			$$
+		`)
+		if err != nil {
+			log.Printf("[Migration] Warning: error during decompression (may be no compressed chunks): %v", err)
+		}
+
+		// Step 2: Disable compression temporarily
+		log.Println("[Migration] Disabling compression temporarily...")
+		_, err = db.Exec(`ALTER TABLE logs_partitioned SET (timescaledb.compress = false)`)
+		if err != nil {
+			log.Printf("[Migration] Warning: failed to disable compression: %v", err)
+		}
+	}
+
+	// Step 3: Alter column types to DOUBLE PRECISION
+	log.Println("[Migration] Altering column types to DOUBLE PRECISION...")
+	_, err = db.Exec(`
+		ALTER TABLE logs_partitioned
+			ALTER COLUMN request_time TYPE DOUBLE PRECISION,
+			ALTER COLUMN upstream_response_time TYPE DOUBLE PRECISION
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to alter column types: %w", err)
+	}
+	log.Println("[Migration] Column types changed successfully")
+
+	if isHypertable {
+		// Step 4: Re-enable compression with same settings
+		log.Println("[Migration] Re-enabling compression...")
+		_, err = db.Exec(`
+			ALTER TABLE logs_partitioned SET (
+				timescaledb.compress,
+				timescaledb.compress_segmentby = 'host, log_type',
+				timescaledb.compress_orderby = 'created_at DESC'
+			)
+		`)
+		if err != nil {
+			log.Printf("[Migration] Warning: failed to re-enable compression: %v", err)
+		}
+
+		// Step 5: Recompress old chunks (optional, in background)
+		log.Println("[Migration] Recompressing chunks older than 7 days in background...")
+		go func() {
+			time.Sleep(5 * time.Second)
+			_, err := db.Exec(`SELECT compress_chunk(c) FROM show_chunks('logs_partitioned', older_than => INTERVAL '7 days') c`)
+			if err != nil {
+				log.Printf("[Migration] Warning: background recompression had issues: %v", err)
+			} else {
+				log.Println("[Migration] Background recompression completed")
+			}
+		}()
+	}
+
+	// Mark migration as complete
+	_, err = db.Exec(`INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, migrationVersion)
+	if err != nil {
+		return fmt.Errorf("failed to record migration: %w", err)
+	}
+
+	log.Printf("[Migration] %s completed successfully!", migrationVersion)
+	return nil
+}
+
+// runPartitionTimezoneMigration fixes the partition timezone detection bug (Issue #38 related)
+// The original 007 migration incorrectly detected local timezone when pg_get_expr()
+// displays UTC timestamps in the session's timezone (e.g., +00 shown as +09 in KST)
+func (db *DB) runPartitionTimezoneMigration() error {
+	const migrationVersion = "008_fix_partition_timezone_v2"
+
+	// Check if already migrated
+	var migrated bool
+	err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, migrationVersion).Scan(&migrated)
+	if err != nil {
+		return fmt.Errorf("failed to check migration status: %w", err)
+	}
+	if migrated {
+		log.Printf("[Migration] %s already applied", migrationVersion)
+		return nil
+	}
+
+	log.Printf("[Migration] Starting %s: fixing partition timezone detection...", migrationVersion)
+
+	// Read and execute the migration file
+	content, err := migrationFS.ReadFile("migrations/008_fix_partition_timezone_v2.sql")
+	if err != nil {
+		return fmt.Errorf("failed to read 008_fix_partition_timezone_v2.sql: %w", err)
+	}
+
+	_, err = db.Exec(string(content))
+	if err != nil {
+		log.Printf("[Migration] Warning: %s had issues (may be partially applied): %v", migrationVersion, err)
+		// Continue anyway - the function replacement should still work
+	}
+
+	// Mark migration as complete
+	_, err = db.Exec(`INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, migrationVersion)
+	if err != nil {
+		return fmt.Errorf("failed to record migration: %w", err)
+	}
+
+	log.Printf("[Migration] %s completed successfully!", migrationVersion)
+	return nil
+}
+
+// runPregeneratePartitionsMigration pre-generates partitions for 10 years
+// This avoids timezone-related bugs from dynamic partition creation
+func (db *DB) runPregeneratePartitionsMigration() error {
+	const migrationVersion = "009_pregenerate_partitions"
+
+	// Check if already migrated
+	var migrated bool
+	err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, migrationVersion).Scan(&migrated)
+	if err != nil {
+		return fmt.Errorf("failed to check migration status: %w", err)
+	}
+	if migrated {
+		log.Printf("[Migration] %s already applied", migrationVersion)
+		return nil
+	}
+
+	log.Printf("[Migration] Starting %s: pre-generating partitions for 10 years...", migrationVersion)
+
+	// Read and execute the migration file
+	content, err := migrationFS.ReadFile("migrations/009_pregenerate_partitions.sql")
+	if err != nil {
+		return fmt.Errorf("failed to read 009_pregenerate_partitions.sql: %w", err)
+	}
+
+	_, err = db.Exec(string(content))
+	if err != nil {
+		log.Printf("[Migration] Warning: %s had issues (may be partially applied): %v", migrationVersion, err)
+		// Continue anyway - partitions may be partially created
+	}
+
+	// Mark migration as complete
+	_, err = db.Exec(`INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, migrationVersion)
+	if err != nil {
+		return fmt.Errorf("failed to record migration: %w", err)
+	}
+
+	log.Printf("[Migration] %s completed successfully!", migrationVersion)
+	return nil
+}
+
+// runHypertableNumericFixMigration fixes numeric type that was reintroduced by TimescaleDB migration (Issue #55)
+// The migrateToTimescaleDB() function previously created logs_hypertable with numeric(10,6),
+// which overrode the double precision fix from migration 006.
+func (db *DB) runHypertableNumericFixMigration() error {
+	const migrationVersion = "010_fix_hypertable_numeric"
+
+	// Check if already migrated
+	var migrated bool
+	err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, migrationVersion).Scan(&migrated)
+	if err != nil {
+		return fmt.Errorf("failed to check migration status: %w", err)
+	}
+	if migrated {
+		log.Printf("[Migration] %s already applied", migrationVersion)
+		return nil
+	}
+
+	log.Printf("[Migration] Starting %s: fixing hypertable numeric type...", migrationVersion)
+
+	// Read and execute the migration file
+	content, err := migrationFS.ReadFile("migrations/010_fix_hypertable_numeric.sql")
+	if err != nil {
+		return fmt.Errorf("failed to read 010_fix_hypertable_numeric.sql: %w", err)
+	}
+
+	_, err = db.Exec(string(content))
+	if err != nil {
+		log.Printf("[Migration] Warning: %s had issues (may be partially applied): %v", migrationVersion, err)
+	}
+
+	// Recompress old chunks in background if applicable
+	if db.isTimescaleDBAvailable() && db.isHypertable("logs_partitioned") {
+		go func() {
+			time.Sleep(5 * time.Second)
+			_, err := db.Exec(`SELECT compress_chunk(c) FROM show_chunks('logs_partitioned', older_than => INTERVAL '7 days') c`)
+			if err != nil {
+				log.Printf("[Migration] Warning: background recompression after 010 had issues: %v", err)
+			} else {
+				log.Println("[Migration] Background recompression after 010 completed")
+			}
+		}()
+	}
+
+	// Mark migration as complete
+	_, err = db.Exec(`INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, migrationVersion)
+	if err != nil {
+		return fmt.Errorf("failed to record migration: %w", err)
+	}
+
+	log.Printf("[Migration] %s completed successfully!", migrationVersion)
+	return nil
+}
+
+// logsPartitionedIndexes is the canonical index set the LIVE logs_partitioned
+// table must carry (mirrors the 001_init.sql definitions + upgradeSQL
+// additions + the pg_trgm search indexes).
+//
+// Why this exists: the background hypertable migration creates a NEW table
+// (with only the four idx_logs_ht_* basics) and renames the original to
+// logs_partitioned_backup — which keeps every original idx_logs_part_* index
+// NAME. From then on, every `CREATE INDEX IF NOT EXISTS idx_logs_part_*`
+// (upgradeSQL and the old one-shot 011_trgm_indexes) silently no-ops because
+// the name exists — on the wrong table. Upgraded installs ended up running
+// the hypertable with almost no indexes. ensureLogsPartitionedIndexes
+// reclaims squatted names from the backup table and builds the indexes on the
+// live table; it runs after the hypertable swap and on every boot thereafter
+// (cheap catalog lookups when everything is in place).
+//
+// Seven indexes 001_init.sql and older upgrades declare are no longer part of
+// the set; see retiredLogsPartitionedIndexes.
+var logsPartitionedIndexes = []struct {
+	Name  string
+	Def   string // USING clause + column list
+	Where string // optional partial-index predicate (must come after WITH)
+}{
+	{"idx_logs_part_host", "USING btree (host)", ""},
+	{"idx_logs_partitioned_exploit_rule", "USING btree (exploit_rule)", "exploit_rule IS NOT NULL AND exploit_rule::text <> '-'"},
+	{"idx_logs_part_client_ip", "USING btree (client_ip)", ""},
+	{"idx_logs_part_created_at", "USING btree (created_at DESC)", ""},
+	{"idx_logs_part_proxy_host_ts", `USING btree (proxy_host_id, "timestamp" DESC)`, "proxy_host_id IS NOT NULL"},
+	{"idx_logs_part_geo_ts", `USING btree (geo_country_code, "timestamp" DESC)`, "geo_country_code IS NOT NULL AND geo_country_code::text <> ''"},
+	{"idx_logs_part_type_created", "USING btree (log_type, created_at DESC)", ""},
+	{"idx_logs_part_block_reason", "USING btree (block_reason)", "block_reason != 'none'"},
+	{"idx_logs_part_status_created", "USING btree (status_code, created_at)", ""},
+	{"idx_logs_part_block_reason_created", "USING btree (created_at DESC, block_reason)", "block_reason != 'none' AND log_type = 'access'"},
+	{"idx_logs_part_host_trgm", "USING gin (host gin_trgm_ops)", ""},
+	{"idx_logs_part_uri_trgm", "USING gin (request_uri gin_trgm_ops)", ""},
+	{"idx_logs_part_ua_trgm", "USING gin (http_user_agent gin_trgm_ops)", ""},
+}
+
+// retiredLogsPartitionedIndexes are logs_partitioned indexes NPG no longer
+// builds, dropped where an earlier version built them. Measured on an
+// attack-day mix (3M rows), no filter, sort, dashboard or autocomplete query
+// got slower without them once the time sort reads created_at (see List), and
+// the sparse indexes TimescaleDB derives for compressed chunks came out the
+// same. Each one cost space on every uncompressed day (about 377 MB a day
+// together on the busiest install) and a write on every insert.
+//
+// Never list idx_logs_ht_* or logs_hypertable_created_at_idx here. Each has an
+// identical canonical twin (idx_logs_part_host, idx_logs_part_created_at,
+// idx_logs_part_type_created, idx_logs_partitioned_exploit_rule), and a chunk
+// created after both existed carries ONE physical index for the pair, owned by
+// whichever was created first: dropping the owner leaves that chunk without the
+// index its twin still promises. retireLogsPartitionedIndexes refuses any drop
+// that has such a twin.
+var retiredLogsPartitionedIndexes = []struct {
+	Name   string
+	Reason string
+}{
+	{"idx_logs_part_log_type", "idx_logs_part_type_created leads with log_type"},
+	{"idx_logs_part_timestamp", "the time sort reads created_at"},
+	{"idx_logs_part_type_timestamp", "idx_logs_part_type_created serves log_type in time order"},
+	{"idx_logs_part_host_ts", "idx_logs_part_host serves the host filter"},
+	{"idx_logs_part_status_ts", "idx_logs_part_status_created serves the status filter"},
+	{"idx_logs_part_status_code", "partial, so it cannot serve the status sort; idx_logs_part_status_created serves both"},
+	{"idx_logs_part_block_reason_ts", "idx_logs_part_block_reason and idx_logs_part_block_reason_created serve the block filters"},
+}
+
+// indexDefWithoutName is an index's definition with its name cut out, so two
+// indexes built alike on the same table compare equal.
+const indexDefWithoutName = `regexp_replace(pg_get_indexdef(i.indexrelid), '^CREATE (UNIQUE )?INDEX \S+ ON ', '')`
+
+// retireLogsPartitionedIndexes drops the retired indexes where they exist. Each
+// DROP runs in its own transaction under a short lock_timeout: DROP INDEX locks
+// the hypertable and every chunk exclusively, so a drop that cannot get its
+// locks at once rolls back whole and is tried again on the next boot instead of
+// holding log inserts behind it.
+func (db *DB) retireLogsPartitionedIndexes() {
+	retired := make([]string, len(retiredLogsPartitionedIndexes))
+	for i, idx := range retiredLogsPartitionedIndexes {
+		retired[i] = idx.Name
+	}
+	for _, idx := range retiredLogsPartitionedIndexes {
+		var onTable, def string
+		err := db.QueryRow(`
+			SELECT c.relname, `+indexDefWithoutName+`
+			FROM pg_index i
+			JOIN pg_class ic ON ic.oid = i.indexrelid
+			JOIN pg_namespace n ON n.oid = ic.relnamespace
+			JOIN pg_class c ON c.oid = i.indrelid
+			WHERE n.nspname = 'public' AND ic.relname = $1`, idx.Name).Scan(&onTable, &def)
+		if err == sql.ErrNoRows {
+			continue // never built here, or already retired
+		}
+		if err != nil {
+			log.Printf("[Migration] Warning: could not check retired index %s: %v", idx.Name, err)
+			continue
+		}
+		if onTable != "logs_partitioned" && onTable != "logs_partitioned_backup" {
+			log.Printf("[Migration] Warning: retired index name %s is on unexpected table %q; leaving it alone", idx.Name, onTable)
+			continue
+		}
+
+		// An identical index that stays may share this one's physical chunk
+		// indexes; see retiredLogsPartitionedIndexes. Identical retired
+		// indexes do not count: neither of them stays.
+		var twins int
+		if err := db.QueryRow(`
+			SELECT count(*)
+			FROM pg_index i
+			JOIN pg_class ic ON ic.oid = i.indexrelid
+			WHERE i.indrelid = to_regclass('public.logs_partitioned')
+			  AND ic.relname <> ALL($1)
+			  AND `+indexDefWithoutName+` = $2`, pq.Array(retired), def).Scan(&twins); err != nil {
+			log.Printf("[Migration] Warning: could not check %s for an identical index: %v", idx.Name, err)
+			continue
+		}
+		if twins > 0 {
+			log.Printf("[Migration] Not retiring %s: an identical index stays on logs_partitioned and may own the only physical index on newer chunks", idx.Name)
+			continue
+		}
+
+		err = func() error {
+			tx, err := db.Begin()
+			if err != nil {
+				return err
+			}
+			defer tx.Rollback()
+			if _, err := tx.Exec(`SET LOCAL lock_timeout = '3s'`); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`DROP INDEX IF EXISTS public.` + pq.QuoteIdentifier(idx.Name)); err != nil {
+				return err
+			}
+			return tx.Commit()
+		}()
+		if err != nil {
+			log.Printf("[Migration] Retiring index %s deferred to the next boot: %v", idx.Name, err)
+			continue
+		}
+		log.Printf("[Migration] Retired index %s on %s (%s)", idx.Name, onTable, idx.Reason)
+	}
+}
+
+// ensureLogsPartitionedIndexes verifies every canonical index exists ON the
+// live logs_partitioned table, reclaiming names squatted by
+// logs_partitioned_backup (the backup exists only for operator verification
+// and does not need indexes). Heavy builds use TimescaleDB's
+// transaction_per_chunk so ingest stays mostly unblocked on large installs.
+// It first drops the retired indexes (retireLogsPartitionedIndexes); every
+// caller goes through here.
+func (db *DB) ensureLogsPartitionedIndexes() {
+	db.retireLogsPartitionedIndexes()
+
+	var isHypertable bool
+	_ = db.QueryRow(`SELECT EXISTS (
+		SELECT 1 FROM timescaledb_information.hypertables
+		WHERE hypertable_name = 'logs_partitioned'
+	)`).Scan(&isHypertable)
+
+	created := 0
+	for _, idx := range logsPartitionedIndexes {
+		// Join pg_index for indisvalid: a CREATE INDEX interrupted partway (build
+		// failure, or process restart mid-build — Close() waits only 5s) leaves an
+		// INVALID index whose NAME exists. A name-only check (pg_indexes) would
+		// treat it as present and never rebuild it, stranding an unusable index
+		// forever. Detect indisvalid=false on the live table and DROP+recreate.
+		var onTable string
+		var valid bool
+		err := db.QueryRow(
+			`SELECT c.relname, i.indisvalid
+			   FROM pg_index i
+			   JOIN pg_class ic ON ic.oid = i.indexrelid
+			   JOIN pg_namespace n ON n.oid = ic.relnamespace
+			   JOIN pg_class c ON c.oid = i.indrelid
+			  WHERE n.nspname = 'public' AND ic.relname = $1`,
+			idx.Name,
+		).Scan(&onTable, &valid)
+		switch {
+		case err == nil && onTable == "logs_partitioned" && valid:
+			continue // already on the live table and usable
+		case err == nil && onTable == "logs_partitioned" && !valid:
+			// Invalid index latched on the live table — drop so it gets rebuilt.
+			if _, dropErr := db.Exec(fmt.Sprintf(`DROP INDEX IF EXISTS public.%s`, idx.Name)); dropErr != nil {
+				log.Printf("[Migration] Warning: could not drop invalid index %s for rebuild: %v", idx.Name, dropErr)
+				continue
+			}
+			log.Printf("[Migration] Dropped invalid index %s on logs_partitioned for rebuild", idx.Name)
+		case err == nil && onTable == "logs_partitioned_backup":
+			if _, dropErr := db.Exec(fmt.Sprintf(`DROP INDEX IF EXISTS public.%s`, idx.Name)); dropErr != nil {
+				log.Printf("[Migration] Warning: could not reclaim index name %s from backup table: %v", idx.Name, dropErr)
+				continue
+			}
+			log.Printf("[Migration] Reclaimed index name %s from logs_partitioned_backup", idx.Name)
+		case err == nil:
+			log.Printf("[Migration] Warning: index %s exists on unexpected table %q; leaving it alone", idx.Name, onTable)
+			continue
+		case err != sql.ErrNoRows:
+			log.Printf("[Migration] Warning: could not check index %s: %v", idx.Name, err)
+			continue
+		}
+
+		stmt := fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON logs_partitioned %s", idx.Name, idx.Def)
+		if isHypertable {
+			stmt += " WITH (timescaledb.transaction_per_chunk)"
+		}
+		if idx.Where != "" {
+			stmt += " WHERE " + idx.Where
+		}
+		if _, err := db.Exec(stmt); err != nil {
+			// transaction_per_chunk is best-effort; retry as a plain build.
+			plain := fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON logs_partitioned %s", idx.Name, idx.Def)
+			if idx.Where != "" {
+				plain += " WHERE " + idx.Where
+			}
+			if _, err2 := db.Exec(plain); err2 != nil {
+				log.Printf("[Migration] Warning: failed to create index %s: %v (plain retry: %v)", idx.Name, err, err2)
+				continue
+			}
+		}
+		created++
+		log.Printf("[Migration] Created index %s on logs_partitioned", idx.Name)
+	}
+
+	if created > 0 {
+		log.Printf("[Migration] logs_partitioned index ensure: %d index(es) built", created)
+	}
+}
+
+// runTrgmIndexMigration enables pg_trgm and ensures the canonical
+// logs_partitioned index set. When the background hypertable migration has
+// not happened yet it defers entirely — building indexes on the pre-swap
+// table would strand them on the future backup table (the original bug that
+// left upgraded installs without indexes). The ensure pass runs in the
+// background: GIN/trgm builds over a large hypertable can take a long time
+// and must not block boot.
+func (db *DB) runTrgmIndexMigration() error {
+	// Enable pg_trgm extension
+	if _, err := db.Exec("CREATE EXTENSION IF NOT EXISTS pg_trgm"); err != nil {
+		return fmt.Errorf("failed to create pg_trgm extension: %w", err)
+	}
+
+	var swapped bool
+	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 'timescaledb_hypertable')`).Scan(&swapped); err != nil {
+		return fmt.Errorf("failed to check hypertable migration status: %w", err)
+	}
+	// Defer only when the swap genuinely hasn't happened yet — building indexes
+	// on the pre-swap logs_partitioned would strand them on the future backup
+	// table. But if logs_partitioned is ALREADY a hypertable (e.g. a prior boot
+	// completed the swap but never recorded the marker, or migrateToTimescaleDB
+	// took its "hypertable already exists" early-return path), deferring would
+	// wait on a migration that returns without ever calling ensure — leaving the
+	// trgm/search indexes permanently unbuilt. Detect that and ensure directly.
+	if !swapped && db.isTimescaleDBAvailable() && !db.isHypertable("logs_partitioned") {
+		log.Println("[Migration] Deferring logs_partitioned index ensure until the hypertable migration completes")
+		return nil
+	}
+
+	db.TrackBackground()
+	go func() {
+		defer db.BackgroundDone()
+		db.ensureLogsPartitionedIndexes()
+	}()
+	return nil
+}
+
+// ExploitRulesAutoDisableSQL is the one-shot UPDATE + system_logs entry used by
+// RunMigrations (embedded inside upgradeSQL) and by integration tests that need
+// to exercise the migration independently. It is safe to run repeatedly:
+//   - ADD COLUMN IF NOT EXISTS is a no-op after the first run.
+//   - The UPDATE filters on auto_disabled_at IS NULL, so it only touches rows the
+//     migration has not yet marked. Admins who have re-enabled the rules keep
+//     their choice.
+//
+// See GitHub Issue #123.
+const ExploitRulesAutoDisableSQL = `
+ALTER TABLE public.exploit_block_rules ADD COLUMN IF NOT EXISTS auto_disabled_at timestamp with time zone;
+
+DO $$
+DECLARE
+    affected_count int := 0;
+BEGIN
+    UPDATE public.exploit_block_rules
+    SET enabled = false,
+        auto_disabled_at = now()
+    WHERE id IN (
+        'a5cb921c-2c10-475b-8753-a56e2af1e5ba',
+        '41d1f7bf-9179-44cb-b41a-1685ce88d965',
+        'aa90285b-2986-46f9-80e6-99946327cd24'
+    )
+    AND is_system = true
+    AND enabled = true
+    AND auto_disabled_at IS NULL;
+
+    GET DIAGNOSTICS affected_count = ROW_COUNT;
+    IF affected_count > 0 THEN
+        INSERT INTO public.system_logs (source, level, message, details, component)
+        VALUES (
+            'internal',
+            'info',
+            format('Auto-disabled %s overly-broad exploit rule(s) to prevent false positives on search/CMS endpoints. Review and optionally re-enable at /waf/exploit-rules.', affected_count),
+            jsonb_build_object(
+                'rule_ids', ARRAY[
+                    'a5cb921c-2c10-475b-8753-a56e2af1e5ba',
+                    '41d1f7bf-9179-44cb-b41a-1685ce88d965',
+                    'aa90285b-2986-46f9-80e6-99946327cd24'
+                ],
+                'reason', 'github issue #123: simple keyword matching produces false positives on legitimate search queries',
+                'rollback_hint', 'set enabled=true in the UI; the migration will not touch these rows again once auto_disabled_at is set'
+            ),
+            'exploit_rules_migration'
+        );
+    END IF;
+END $$;
+`
+
+// ApplyExploitRulesAutoDisable runs the one-shot auto-disable migration against
+// an already-open database handle. Used by integration tests to re-exercise the
+// migration after mutating the table. Production startup uses the equivalent
+// SQL embedded inside RunMigrations() upgradeSQL. Both share the exact string
+// intent documented in ExploitRulesAutoDisableSQL.
+func ApplyExploitRulesAutoDisable(db *sql.DB) error {
+	_, err := db.Exec(ExploitRulesAutoDisableSQL)
+	return err
+}
+
+// upgradeStep is one statement of the boot-time upgrade list.
+type upgradeStep struct {
+	desc string
+	sql  string
+}
+
+// postgresUpgrades is the upgrade list RunMigrations replays, one Exec per
+// entry, on every boot. Every new upgrade statement belongs here; NEVER
+// reintroduce a multi-statement Exec (see RunMigrations).
+//
+// It is a function rather than a literal inside RunMigrations so the MySQL
+// schema sync can read the same list: the PostgreSQL entries stay the one
+// place a schema change is written (see migration_mysql.go).
+func postgresUpgrades() []upgradeStep {
+	return []upgradeStep{
 		// -----------------------------------------------------------------------
 		// Detach orphan chunk children. On installs that survived earlier
 		// migration glitches (notably the v2.7.x → v2.8.x partitioned-table →
@@ -1495,7 +2943,7 @@ UPDATE public.system_settings
 		},
 		{
 			desc: "v2.53.0: global fail2ban jail for unmatched-host traffic (#275)",
-			sql:  `CREATE TABLE IF NOT EXISTS public.global_fail2ban (
+			sql: `CREATE TABLE IF NOT EXISTS public.global_fail2ban (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     enabled boolean DEFAULT false NOT NULL,
     max_retries integer DEFAULT 5 NOT NULL,
@@ -1911,1430 +3359,4 @@ END $$;`,
 )`,
 		},
 	}
-	for _, a := range upgrades {
-		if _, err := db.Exec(a.sql); err != nil {
-			// Warn-and-continue is deliberate (see the header comment above —
-			// a fail-fast boot would brick existing installs; statements are
-			// idempotent and retried next boot). Record the failure so
-			// MigrationHealth() can surface the partially-migrated schema
-			// instead of health staying silently green.
-			log.Printf("Warning: upgrade %q failed: %v", a.desc, err)
-			db.RecordMigrationFailure(a.desc, err)
-		}
-	}
-	if count, lastErr := db.MigrationHealth(); count > 0 {
-		log.Printf("[Migration] ERROR: %d upgrade statement(s) failed — schema may be partially migrated and affected features can return errors until a restart retries them. Last failure: %s", count, lastErr)
-	}
-
-	// v2.13.3: one-shot auto-disable for overly-broad system rules (Issue #123).
-	// Runs as an INDEPENDENT db.Exec so a prior failure in upgradeSQL (e.g. a
-	// stale TimescaleDB chunk error that aborts the implicit transaction) cannot
-	// silently skip the fix. v2.13.2 placed this DO block inside upgradeSQL and
-	// the implicit-transaction abort left the three rules enabled on affected
-	// installations. The helper is idempotent — it only updates rows where
-	// auto_disabled_at IS NULL AND enabled = true, so admins who have already
-	// re-enabled are not touched and repeat boots are no-ops.
-	if err := ApplyExploitRulesAutoDisable(db.DB); err != nil {
-		log.Printf("Warning: exploit rules auto-disable migration failed: %v", err)
-	}
-
-	// Run 006_fix_numeric_overflow migration for existing installations (Issue #29 fix)
-	if err := db.runNumericOverflowMigration(); err != nil {
-		log.Printf("Warning: numeric overflow migration had issues: %v", err)
-	}
-
-	// Run 008_fix_partition_timezone_v2 migration (fixes timezone detection bug in 007)
-	if err := db.runPartitionTimezoneMigration(); err != nil {
-		log.Printf("Warning: partition timezone migration had issues: %v", err)
-	}
-
-	// Run 009_pregenerate_partitions migration (pre-generates 10 years of partitions)
-	if err := db.runPregeneratePartitionsMigration(); err != nil {
-		log.Printf("Warning: partition pre-generation migration had issues: %v", err)
-	}
-
-	// Run 010_fix_hypertable_numeric migration (fixes numeric type after TimescaleDB migration, Issue #55)
-	if err := db.runHypertableNumericFixMigration(); err != nil {
-		log.Printf("Warning: hypertable numeric fix migration had issues: %v", err)
-	}
-
-	// Add pg_trgm GIN indexes for ILIKE search performance on logs
-	if err := db.runTrgmIndexMigration(); err != nil {
-		log.Printf("Warning: pg_trgm index migration had issues: %v", err)
-	}
-
-	// Migrate logs table to logs_partitioned in background (for existing installations).
-	// This allows API to start immediately while migration runs. Each migration
-	// derives its timeout from db.BackgroundContext() so a SIGTERM during
-	// migration cancels it instead of letting it run for ~30 minutes after
-	// the process is supposed to be shutting down (Issue: orphan goroutine
-	// risk on container restart).
-	db.TrackBackground()
-	go func() {
-		defer db.BackgroundDone()
-		ctx, cancel := context.WithTimeout(db.BackgroundContext(), 30*time.Minute)
-		defer cancel()
-		_ = ctx // wired through Close() via BackgroundContext cancellation
-		db.migrateLogsToPartitioned()
-	}()
-
-	// Migrate to TimescaleDB hypertable in background (for existing installations)
-	db.TrackBackground()
-	go func() {
-		defer db.BackgroundDone()
-		ctx, cancel := context.WithTimeout(db.BackgroundContext(), 30*time.Minute)
-		defer cancel()
-		_ = ctx
-		db.migrateToTimescaleDB()
-	}()
-
-	// Migrate other log tables to hypertables
-	db.TrackBackground()
-	go func() {
-		defer db.BackgroundDone()
-		ctx, cancel := context.WithTimeout(db.BackgroundContext(), 30*time.Minute)
-		defer cancel()
-		_ = ctx
-		db.migrateLogTablesToHypertables()
-	}()
-
-	log.Println("Schema migration completed")
-	return nil
-}
-
-// enableTimescaleDB enables the TimescaleDB extension
-func (db *DB) enableTimescaleDB() error {
-	_, err := db.Exec(`CREATE EXTENSION IF NOT EXISTS timescaledb CASCADE`)
-	if err != nil {
-		return err
-	}
-	log.Println("[TimescaleDB] Extension enabled successfully")
-	return nil
-}
-
-// isTimescaleDBAvailable checks if TimescaleDB extension is available
-func (db *DB) isTimescaleDBAvailable() bool {
-	var available bool
-	err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'timescaledb')`).Scan(&available)
-	return err == nil && available
-}
-
-// isHypertable checks if a table is already a TimescaleDB hypertable
-func (db *DB) isHypertable(tableName string) bool {
-	var isHyper bool
-	err := db.QueryRow(`
-		SELECT EXISTS(
-			SELECT 1 FROM timescaledb_information.hypertables
-			WHERE hypertable_name = $1
-		)
-	`, tableName).Scan(&isHyper)
-	return err == nil && isHyper
-}
-
-// migrateLogsToPartitioned migrates data from old logs table to logs_partitioned
-func (db *DB) migrateLogsToPartitioned() {
-	// Check if old logs table exists
-	var logsExists bool
-	err := db.QueryRow(`
-		SELECT EXISTS(
-			SELECT 1 FROM information_schema.tables
-			WHERE table_schema = 'public' AND table_name = 'logs'
-		)
-	`).Scan(&logsExists)
-	if err != nil || !logsExists {
-		return // No old logs table, nothing to migrate
-	}
-
-	// Check if there's data to migrate
-	var count int
-	err = db.QueryRow(`SELECT COUNT(*) FROM logs LIMIT 1`).Scan(&count)
-	if err != nil || count == 0 {
-		// No data, just drop the old table
-		log.Println("[Migration] Dropping empty logs table...")
-		db.Exec(`DROP TABLE IF EXISTS logs CASCADE`)
-		return
-	}
-
-	log.Printf("[Migration] Found old logs table with data, migrating to logs_partitioned...")
-
-	// Migrate in batches
-	batchSize := 50000
-	totalMigrated := 0
-
-	for {
-		result, err := db.Exec(`
-			WITH batch AS (
-				SELECT id FROM logs
-				WHERE NOT EXISTS (SELECT 1 FROM logs_partitioned lp WHERE lp.id = logs.id)
-				LIMIT $1
-			)
-			INSERT INTO logs_partitioned (
-				id, log_type, timestamp, host, client_ip,
-				request_method, request_uri, request_protocol, status_code,
-				body_bytes_sent, request_time, upstream_response_time,
-				upstream_addr, upstream_status,
-				http_referer, http_user_agent, http_x_forwarded_for,
-				severity, error_message,
-				rule_id, rule_message, rule_severity, rule_data, attack_type, action_taken,
-				proxy_host_id, raw_log, created_at,
-				geo_country, geo_country_code, geo_city, geo_asn, geo_org,
-				block_reason, bot_category, exploit_rule
-			)
-			SELECT
-				l.id, l.log_type, l.timestamp, l.host, l.client_ip,
-				l.request_method, l.request_uri, l.request_protocol, l.status_code,
-				l.body_bytes_sent, l.request_time, l.upstream_response_time,
-				l.upstream_addr, l.upstream_status,
-				l.http_referer, l.http_user_agent, l.http_x_forwarded_for,
-				l.severity, l.error_message,
-				l.rule_id, l.rule_message, l.rule_severity, l.rule_data, l.attack_type, l.action_taken,
-				l.proxy_host_id, l.raw_log, l.created_at,
-				l.geo_country, l.geo_country_code, l.geo_city, l.geo_asn, l.geo_org,
-				l.block_reason, l.bot_category, l.exploit_rule
-			FROM logs l
-			WHERE l.id IN (SELECT id FROM batch)
-		`, batchSize)
-
-		if err != nil {
-			log.Printf("[Migration] Error migrating logs batch: %v", err)
-			break
-		}
-
-		rowsAffected, _ := result.RowsAffected()
-		totalMigrated += int(rowsAffected)
-
-		if rowsAffected < int64(batchSize) {
-			break
-		}
-
-		log.Printf("[Migration] Migrated %d logs so far...", totalMigrated)
-	}
-
-	if totalMigrated > 0 {
-		log.Printf("[Migration] Migrated %d logs to logs_partitioned", totalMigrated)
-	}
-
-	// Drop old logs table
-	log.Println("[Migration] Dropping old logs table...")
-	_, err = db.Exec(`DROP TABLE IF EXISTS logs CASCADE`)
-	if err != nil {
-		log.Printf("[Migration] Warning: failed to drop old logs table: %v", err)
-	} else {
-		log.Println("[Migration] Old logs table dropped successfully")
-
-		// `DROP ... CASCADE` also drops dependent objects, which includes logs_unified
-		// if it was built from both `logs` and `logs_partitioned` during startup.
-		// Rebuild it immediately so live log queries don't hit "relation does not exist".
-		_, rebuildErr := db.Exec(`
-			DROP VIEW IF EXISTS public.logs_unified CASCADE;
-			CREATE VIEW public.logs_unified AS
-			 SELECT id, log_type, "timestamp", host, client_ip,
-			        geo_country, geo_country_code, geo_city, geo_asn, geo_org,
-			        request_method, request_uri, request_protocol, status_code,
-			        body_bytes_sent, request_time, upstream_response_time,
-			        http_referer, http_user_agent, http_x_forwarded_for,
-			        severity, error_message,
-			        rule_id, rule_message, rule_severity, rule_data,
-			        attack_type, action_taken,
-			        block_reason, bot_category,
-			        proxy_host_id, raw_log, created_at,
-			        upstream_addr, upstream_status
-			   FROM public.logs_partitioned
-		`)
-		if rebuildErr != nil {
-			log.Printf("[Migration] Warning: failed to rebuild logs_unified view after drop: %v", rebuildErr)
-		} else {
-			log.Println("[Migration] logs_unified view rebuilt (single-table form)")
-		}
-	}
-}
-
-// migrateToTimescaleDB converts logs_partitioned (PostgreSQL native PARTITION BY
-// RANGE table created by 001_init.sql) into a TimescaleDB hypertable. Runs once
-// per install: marked complete in schema_migrations as 'timescaledb_hypertable'.
-// Applies to both fresh installs and existing installations that pre-date the
-// hypertable conversion — fresh installs simply migrate zero rows.
-func (db *DB) migrateToTimescaleDB() {
-	// Wait a bit for other migrations to complete
-	time.Sleep(5 * time.Second)
-
-	// Check if TimescaleDB is available
-	if !db.isTimescaleDBAvailable() {
-		log.Println("[TimescaleDB] Extension not available, skipping migration")
-		return
-	}
-
-	// Check if already migrated
-	var migrated bool
-	err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 'timescaledb_hypertable')`).Scan(&migrated)
-	if err == nil && migrated {
-		log.Println("[TimescaleDB] Already migrated to hypertable")
-		// Still set up compression policy
-		db.setupTimescaleDBCompression()
-		return
-	}
-
-	// Check if logs_hypertable already exists (indicates in-progress or completed migration)
-	if db.isHypertable("logs_hypertable") {
-		log.Println("[TimescaleDB] Hypertable already exists")
-		db.setupTimescaleDBCompression()
-		// This branch returns without swapping/recording the marker, so the
-		// canonical index ensure (deferred by runTrgmIndexMigration when the
-		// marker is absent) would otherwise never run on these installs. Run it
-		// here so the trgm/search indexes still get built. (Already in a
-		// background goroutine — safe to run inline.)
-		db.ensureLogsPartitionedIndexes()
-		return
-	}
-
-	// Check if logs_partitioned exists and has data
-	var hasData bool
-	err = db.QueryRow(`
-		SELECT EXISTS(
-			SELECT 1 FROM information_schema.tables
-			WHERE table_schema = 'public' AND table_name = 'logs_partitioned'
-		)
-	`).Scan(&hasData)
-	if err != nil || !hasData {
-		log.Println("[TimescaleDB] No logs_partitioned table found, will create hypertable on fresh install")
-		return
-	}
-
-	log.Println("[TimescaleDB] Starting migration from partitioned table to hypertable...")
-	ctx := context.Background()
-
-	// Use transaction for safety
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("[TimescaleDB] Failed to begin transaction: %v", err)
-		return
-	}
-	defer tx.Rollback()
-
-	// Step 1: Create new hypertable with same structure
-	log.Println("[TimescaleDB] Creating hypertable structure...")
-	_, err = tx.Exec(`
-		CREATE TABLE IF NOT EXISTS logs_hypertable (
-			id uuid NOT NULL DEFAULT gen_random_uuid(),
-			log_type log_type NOT NULL,
-			timestamp timestamp with time zone NOT NULL DEFAULT now(),
-			host text,
-			client_ip inet,
-			request_method text,
-			request_uri text,
-			request_protocol text,
-			status_code integer,
-			body_bytes_sent bigint,
-			request_time double precision,
-			upstream_response_time double precision,
-			upstream_addr text,
-			upstream_status text,
-			http_referer text,
-			http_user_agent text,
-			http_x_forwarded_for text,
-			severity log_severity,
-			error_message text,
-			-- bigint, not integer: ModSecurity rule ids exceed int4 (2147483647),
-			-- 001_init.sql declares logs_partitioned.rule_id bigint, and this table
-			-- is renamed over it on fresh installs — a narrower type here would
-			-- stick forever, since ADD COLUMN IF NOT EXISTS never repairs a type (#297)
-			rule_id bigint,
-			rule_message text,
-			rule_severity text,
-			rule_data text,
-			attack_type text,
-			action_taken text,
-			proxy_host_id uuid,
-			raw_log text,
-			created_at timestamp with time zone NOT NULL DEFAULT now(),
-			geo_country text,
-			geo_country_code varchar(2),
-			geo_city text,
-			geo_asn text,
-			geo_org text,
-			block_reason block_reason DEFAULT 'none',
-			bot_category text,
-			exploit_rule varchar(50)
-		)
-	`)
-	if err != nil {
-		log.Printf("[TimescaleDB] Failed to create table structure: %v", err)
-		return
-	}
-
-	// Step 2: Convert to hypertable
-	log.Println("[TimescaleDB] Converting to hypertable...")
-	_, err = tx.Exec(`
-		SELECT create_hypertable(
-			'logs_hypertable',
-			by_range('created_at', INTERVAL '1 day'),
-			if_not_exists => TRUE
-		)
-	`)
-	if err != nil {
-		log.Printf("[TimescaleDB] Failed to create hypertable: %v", err)
-		return
-	}
-
-	if err = tx.Commit(); err != nil {
-		log.Printf("[TimescaleDB] Failed to commit hypertable creation: %v", err)
-		return
-	}
-
-	// Step 3: Migrate data in batches using cursor-based pagination (outside transaction for large data)
-	// Cursor-based pagination avoids O(n²) memory/CPU cost of OFFSET pagination
-	log.Println("[TimescaleDB] Migrating data from partitioned table...")
-	batchSize := 50000
-	totalMigrated := 0
-
-	// Get approximate count for progress reporting (use reltuples for large tables to avoid full scan)
-	var totalCount int64
-	db.QueryRow(`SELECT COALESCE(reltuples::bigint, 0) FROM pg_class WHERE relname = 'logs_partitioned'`).Scan(&totalCount)
-	if totalCount <= 0 {
-		// Fallback to exact count only if estimate is unavailable
-		db.QueryRow(`SELECT COUNT(*) FROM logs_partitioned`).Scan(&totalCount)
-	}
-	log.Printf("[TimescaleDB] Estimated logs to migrate: %d", totalCount)
-
-	// Anti-join pagination (matches migrateLogsToPartitioned). The previous
-	// cursor pagination (`WHERE created_at >= lastCreatedAt`) re-inserted
-	// rows that shared a `created_at` value with the last batch's tail,
-	// and logs_hypertable has no PK to deduplicate — yielding an unbounded
-	// migration loop on installs with bursty log timestamps. NOT EXISTS
-	// makes the loop converge to zero new rows.
-	for {
-		result, err := db.Exec(`
-			INSERT INTO logs_hypertable (
-				id, log_type, timestamp, host, client_ip, request_method, request_uri,
-				request_protocol, status_code, body_bytes_sent, request_time,
-				upstream_response_time, upstream_addr, upstream_status,
-				http_referer, http_user_agent, http_x_forwarded_for,
-				severity, error_message, rule_id, rule_message, rule_severity, rule_data,
-				attack_type, action_taken, proxy_host_id, raw_log, created_at,
-				geo_country, geo_country_code, geo_city, geo_asn, geo_org,
-				block_reason, bot_category, exploit_rule
-			)
-			SELECT
-				lp.id, lp.log_type, lp.timestamp, lp.host, lp.client_ip, lp.request_method, lp.request_uri,
-				lp.request_protocol, lp.status_code, lp.body_bytes_sent, lp.request_time,
-				lp.upstream_response_time, lp.upstream_addr, lp.upstream_status,
-				lp.http_referer, lp.http_user_agent, lp.http_x_forwarded_for,
-				lp.severity, lp.error_message, lp.rule_id, lp.rule_message, lp.rule_severity, lp.rule_data,
-				lp.attack_type, lp.action_taken, lp.proxy_host_id, lp.raw_log, lp.created_at,
-				lp.geo_country, lp.geo_country_code, lp.geo_city, lp.geo_asn, lp.geo_org,
-				lp.block_reason, lp.bot_category, lp.exploit_rule
-			FROM logs_partitioned lp
-			WHERE NOT EXISTS (
-				SELECT 1 FROM logs_hypertable lh WHERE lh.id = lp.id
-			)
-			ORDER BY lp.created_at
-			LIMIT $1
-		`, batchSize)
-
-		if err != nil {
-			log.Printf("[TimescaleDB] Error migrating batch: %v", err)
-			break
-		}
-
-		rowsAffected, _ := result.RowsAffected()
-		if rowsAffected == 0 {
-			break
-		}
-
-		totalMigrated += int(rowsAffected)
-
-		if totalCount > 0 {
-			progress := float64(totalMigrated) / float64(totalCount) * 100
-			log.Printf("[TimescaleDB] Migrated %d/%d logs (%.1f%%)...", totalMigrated, totalCount, progress)
-		} else {
-			log.Printf("[TimescaleDB] Migrated %d logs so far...", totalMigrated)
-		}
-
-		// Small delay to reduce load
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	log.Printf("[TimescaleDB] Migration complete: %d logs migrated", totalMigrated)
-
-	// Step 4: Create indexes on hypertable
-	log.Println("[TimescaleDB] Creating indexes...")
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_logs_ht_timestamp ON logs_hypertable (created_at DESC)`)
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_logs_ht_host ON logs_hypertable (host)`)
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_logs_ht_type_time ON logs_hypertable (log_type, created_at DESC)`)
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_logs_ht_exploit ON logs_hypertable (exploit_rule) WHERE exploit_rule IS NOT NULL AND exploit_rule <> '-'`)
-
-	// Step 5: Swap tables (rename)
-	log.Println("[TimescaleDB] Swapping tables...")
-	tx2, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("[TimescaleDB] Failed to begin swap transaction: %v", err)
-		return
-	}
-	defer tx2.Rollback()
-
-	// Rename old table as backup
-	_, err = tx2.Exec(`ALTER TABLE logs_partitioned RENAME TO logs_partitioned_backup`)
-	if err != nil {
-		log.Printf("[TimescaleDB] Failed to rename old table: %v", err)
-		return
-	}
-
-	// Rename hypertable to logs_partitioned
-	_, err = tx2.Exec(`ALTER TABLE logs_hypertable RENAME TO logs_partitioned`)
-	if err != nil {
-		log.Printf("[TimescaleDB] Failed to rename hypertable: %v", err)
-		// Rollback the rename
-		tx2.Rollback()
-		db.Exec(`ALTER TABLE logs_partitioned_backup RENAME TO logs_partitioned`)
-		return
-	}
-
-	if err = tx2.Commit(); err != nil {
-		log.Printf("[TimescaleDB] Failed to commit table swap: %v", err)
-		return
-	}
-
-	// Mark migration as complete
-	db.Exec(`INSERT INTO schema_migrations (version) VALUES ('timescaledb_hypertable') ON CONFLICT DO NOTHING`)
-
-	log.Println("[TimescaleDB] Migration to hypertable completed successfully!")
-
-	// Set up compression
-	db.setupTimescaleDBCompression()
-
-	// Clean up backup table. On fresh installs the source carried no rows, so
-	// the backup has nothing worth keeping. Critically, its leftover indexes
-	// (idx_logs_part_*) live in the same schema namespace as the new
-	// logs_partitioned, which causes upgradeSQL's `CREATE INDEX IF NOT EXISTS`
-	// statements to silently skip on subsequent boots (the index name already
-	// exists, just on the wrong table). Dropping the empty backup frees those
-	// names so the supporting indexes get created on the live hypertable.
-	// On installs with real data, keep the backup so operators can verify the
-	// migration before dropping it manually.
-	if totalMigrated == 0 {
-		log.Println("[TimescaleDB] Source table was empty, dropping logs_partitioned_backup")
-		if _, err := db.Exec(`DROP TABLE IF EXISTS public.logs_partitioned_backup CASCADE`); err != nil {
-			log.Printf("[TimescaleDB] Warning: failed to drop empty backup: %v", err)
-		}
-	} else {
-		log.Println("[TimescaleDB] Backup table 'logs_partitioned_backup' kept for safety. Drop manually when verified.")
-	}
-
-	// Build the canonical index set on the NEW live hypertable. The swap left
-	// the original idx_logs_part_* names on the backup table, so without this
-	// the live table runs with only the four idx_logs_ht_* basics and every
-	// CREATE INDEX IF NOT EXISTS elsewhere silently no-ops on the squatted
-	// names. (Already in a background goroutine — safe to run inline.)
-	db.ensureLogsPartitionedIndexes()
-}
-
-// migrateLogTablesToHypertables migrates system_logs, challenge_logs, audit_logs to hypertables
-func (db *DB) migrateLogTablesToHypertables() {
-	// Wait for main migration to complete
-	time.Sleep(10 * time.Second)
-
-	if !db.isTimescaleDBAvailable() {
-		log.Println("[TimescaleDB] Extension not available, skipping log tables migration")
-		return
-	}
-
-	// Define log tables to migrate
-	logTables := []struct {
-		name      string
-		segmentBy string
-	}{
-		{"system_logs", "source, level"},
-		{"challenge_logs", "result"},
-		{"audit_logs", "action"},
-	}
-
-	for _, table := range logTables {
-		db.migrateTableToHypertable(table.name, table.segmentBy)
-	}
-}
-
-// migrateTableToHypertable converts a regular table to a TimescaleDB hypertable
-func (db *DB) migrateTableToHypertable(tableName, segmentBy string) {
-	migrationKey := fmt.Sprintf("timescaledb_%s", tableName)
-
-	// Check if already migrated
-	var migrated bool
-	err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, migrationKey).Scan(&migrated)
-	if err == nil && migrated {
-		log.Printf("[TimescaleDB] %s already migrated to hypertable", tableName)
-		db.setupTableCompression(tableName, segmentBy)
-		return
-	}
-
-	// Check if table exists
-	var tableExists bool
-	err = db.QueryRow(`
-		SELECT EXISTS(
-			SELECT 1 FROM information_schema.tables
-			WHERE table_schema = 'public' AND table_name = $1
-		)
-	`, tableName).Scan(&tableExists)
-	if err != nil || !tableExists {
-		log.Printf("[TimescaleDB] Table %s not found, skipping", tableName)
-		return
-	}
-
-	// Check if already a hypertable
-	if db.isHypertable(tableName) {
-		log.Printf("[TimescaleDB] %s is already a hypertable", tableName)
-		db.setupTableCompression(tableName, segmentBy)
-		db.Exec(`INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, migrationKey)
-		return
-	}
-
-	log.Printf("[TimescaleDB] Starting migration of %s to hypertable...", tableName)
-
-	// Get row count
-	var rowCount int64
-	db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM %s`, tableName)).Scan(&rowCount)
-	log.Printf("[TimescaleDB] %s has %d rows", tableName, rowCount)
-
-	// For tables with foreign keys, we need to handle them carefully
-	// Drop foreign key constraints temporarily
-	var fkConstraints []struct {
-		name       string
-		definition string
-	}
-	rows, err := db.Query(`
-		SELECT conname, pg_get_constraintdef(oid)
-		FROM pg_constraint
-		WHERE conrelid = $1::regclass AND contype = 'f'
-	`, tableName)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var name, def string
-			rows.Scan(&name, &def)
-			fkConstraints = append(fkConstraints, struct {
-				name       string
-				definition string
-			}{name, def})
-		}
-	}
-
-	// Drop primary key (will recreate with created_at)
-	db.Exec(fmt.Sprintf(`ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s_pkey`, tableName, tableName))
-
-	// Drop foreign keys temporarily
-	for _, fk := range fkConstraints {
-		log.Printf("[TimescaleDB] Dropping FK %s temporarily", fk.name)
-		db.Exec(fmt.Sprintf(`ALTER TABLE %s DROP CONSTRAINT IF EXISTS %s`, tableName, fk.name))
-	}
-
-	// Convert to hypertable
-	_, err = db.Exec(fmt.Sprintf(`
-		SELECT create_hypertable(
-			'%s',
-			by_range('created_at', INTERVAL '1 day'),
-			migrate_data => true,
-			if_not_exists => true
-		)
-	`, tableName))
-	if err != nil {
-		log.Printf("[TimescaleDB] Failed to convert %s to hypertable: %v", tableName, err)
-		// Restore primary key
-		db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD PRIMARY KEY (id)`, tableName))
-		// Restore foreign keys
-		for _, fk := range fkConstraints {
-			db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD CONSTRAINT %s %s`, tableName, fk.name, fk.definition))
-		}
-		return
-	}
-
-	log.Printf("[TimescaleDB] %s converted to hypertable successfully", tableName)
-
-	// Recreate primary key with created_at (required for hypertables)
-	db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD PRIMARY KEY (id, created_at)`, tableName))
-
-	// Restore foreign keys
-	for _, fk := range fkConstraints {
-		log.Printf("[TimescaleDB] Restoring FK %s", fk.name)
-		_, err := db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD CONSTRAINT %s %s`, tableName, fk.name, fk.definition))
-		if err != nil {
-			log.Printf("[TimescaleDB] Warning: failed to restore FK %s: %v", fk.name, err)
-		}
-	}
-
-	// Mark as migrated
-	db.Exec(`INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, migrationKey)
-
-	// Setup compression
-	db.setupTableCompression(tableName, segmentBy)
-}
-
-// setupTableCompression sets up compression for a specific hypertable
-func (db *DB) setupTableCompression(tableName, segmentBy string) {
-	if !db.isHypertable(tableName) {
-		return
-	}
-
-	// Check if compression is already enabled
-	var compressionEnabled bool
-	db.QueryRow(`
-		SELECT compression_enabled
-		FROM timescaledb_information.hypertables
-		WHERE hypertable_name = $1
-	`, tableName).Scan(&compressionEnabled)
-
-	if compressionEnabled {
-		log.Printf("[TimescaleDB] Compression already enabled for %s", tableName)
-	} else {
-		log.Printf("[TimescaleDB] Setting up compression for %s...", tableName)
-
-		// Enable compression
-		_, err := db.Exec(fmt.Sprintf(`
-			ALTER TABLE %s SET (
-				timescaledb.compress,
-				timescaledb.compress_segmentby = '%s',
-				timescaledb.compress_orderby = 'created_at DESC'
-			)
-		`, tableName, segmentBy))
-		if err != nil {
-			log.Printf("[TimescaleDB] Warning: failed to enable compression for %s: %v", tableName, err)
-			return
-		}
-	}
-
-	// The policy is checked on every boot, not only when compression is first
-	// enabled. It used to be added only in that first pass, so a policy that
-	// was missing afterwards stayed missing and the table was never compressed
-	// again (a dev install: audit_logs, 50 chunks, none compressed). A policy
-	// added here runs straight away and compresses the backlog itself.
-	var jobID int
-	err := db.QueryRow(`
-		SELECT job_id FROM timescaledb_information.jobs
-		WHERE proc_name = 'policy_compression'
-		  AND hypertable_schema = 'public' AND hypertable_name = $1
-		LIMIT 1
-	`, tableName).Scan(&jobID)
-	switch {
-	case err == sql.ErrNoRows:
-		if _, err := db.Exec(fmt.Sprintf(`
-			SELECT add_compression_policy('%s', INTERVAL '7 days', if_not_exists => true)
-		`, tableName)); err != nil {
-			log.Printf("[TimescaleDB] Warning: failed to add compression policy for %s: %v", tableName, err)
-			return
-		}
-		log.Printf("[TimescaleDB] Compression policy added for %s (chunks older than 7 days)", tableName)
-	case err != nil:
-		log.Printf("[TimescaleDB] Warning: could not check the compression policy for %s: %v", tableName, err)
-	}
-
-	// The one-time sweep of existing chunks and the status line belong to the
-	// first enable only.
-	if compressionEnabled {
-		return
-	}
-
-	log.Printf("[TimescaleDB] Compression enabled for %s", tableName)
-
-	// Compress existing old chunks immediately
-	db.Exec(fmt.Sprintf(`SELECT compress_chunk(c) FROM show_chunks('%s', older_than => INTERVAL '7 days') c`, tableName))
-
-	// Show compression status
-	var compressedChunks, totalChunks int
-	err = db.QueryRow(`
-		SELECT
-			COUNT(*) FILTER (WHERE is_compressed) as compressed,
-			COUNT(*) as total
-		FROM timescaledb_information.chunks
-		WHERE hypertable_name = $1
-	`, tableName).Scan(&compressedChunks, &totalChunks)
-	if err == nil && totalChunks > 0 {
-		log.Printf("[TimescaleDB] %s compression status: %d/%d chunks compressed", tableName, compressedChunks, totalChunks)
-	}
-}
-
-// logsCompressAfterDefault is how old a logs_partitioned chunk gets before the
-// compression policy compresses it on a new install. It was 7 days, and an
-// uncompressed day is about ten times its compressed size (about 8 GB a day on
-// the busiest install), so the week of uncompressed chunks was what filled a
-// disk. Compressed days still answer the log screens: aggregating one measured
-// faster than an uncompressed day, and the newest-first list stops in the
-// newest chunk.
-const logsCompressAfterDefault = "1 day"
-
-// logsCompressionPolicy returns the logs_partitioned compression job and its
-// compress_after as stored, or job 0 when there is none.
-func (db *DB) logsCompressionPolicy() (int, string, error) {
-	var jobID int
-	var after string
-	err := db.QueryRow(`
-		SELECT job_id, COALESCE(config->>'compress_after', config->>'compress_created_before', '?')
-		FROM timescaledb_information.jobs
-		WHERE proc_name = 'policy_compression'
-		  AND hypertable_schema = 'public' AND hypertable_name = 'logs_partitioned'
-		ORDER BY job_id
-		LIMIT 1`).Scan(&jobID, &after)
-	if err == sql.ErrNoRows {
-		return 0, "", nil
-	}
-	return jobID, after, err
-}
-
-// setupTimescaleDBCompression sets up compression policy for the hypertable
-func (db *DB) setupTimescaleDBCompression() {
-	if !db.isTimescaleDBAvailable() {
-		return
-	}
-
-	// Check if logs_partitioned is a hypertable
-	if !db.isHypertable("logs_partitioned") {
-		log.Println("[TimescaleDB] logs_partitioned is not a hypertable, skipping compression setup")
-		return
-	}
-
-	log.Println("[TimescaleDB] Setting up compression policy...")
-
-	// Enable compression on the hypertable
-	_, err := db.Exec(`
-		ALTER TABLE logs_partitioned SET (
-			timescaledb.compress,
-			timescaledb.compress_segmentby = 'host, log_type',
-			timescaledb.compress_orderby = 'created_at DESC'
-		)
-	`)
-	if err != nil {
-		log.Printf("[TimescaleDB] Warning: failed to enable compression: %v", err)
-		return
-	}
-
-	// Add the policy only when there is none. add_compression_policy with
-	// if_not_exists does not change an existing policy: given other arguments
-	// it only warns ("A policy already exists with different arguments"), and
-	// it would do that on every boot of every install that kept 7 days or
-	// chose its own value. Existing installs are moved off the old 7-day
-	// default once, by the logs_compress_after_1d_v1 upgrade.
-	jobID, after, err := db.logsCompressionPolicy()
-	if err == nil && jobID == 0 {
-		_, err = db.Exec(`SELECT add_compression_policy('logs_partitioned', INTERVAL '` + logsCompressAfterDefault + `', if_not_exists => true)`)
-		if err == nil {
-			jobID, after, err = db.logsCompressionPolicy()
-		}
-	}
-	if err == nil && jobID == 0 {
-		err = fmt.Errorf("no compression job listed for logs_partitioned after adding one")
-	}
-	if err != nil {
-		log.Printf("[TimescaleDB] Warning: could not set up the logs compression policy: %v", err)
-		return
-	}
-
-	// Read back from the jobs view, so the line states what this install
-	// actually does rather than what the code would have chosen.
-	log.Printf("[TimescaleDB] Compression policy (job %d): chunks older than %s are compressed", jobID, after)
-
-	// Show current compression status
-	var compressedChunks, totalChunks int
-	err = db.QueryRow(`
-		SELECT
-			COUNT(*) FILTER (WHERE is_compressed) as compressed,
-			COUNT(*) as total
-		FROM timescaledb_information.chunks
-		WHERE hypertable_name = 'logs_partitioned'
-	`).Scan(&compressedChunks, &totalChunks)
-	if err == nil {
-		log.Printf("[TimescaleDB] Compression status: %d/%d chunks compressed", compressedChunks, totalChunks)
-	}
-}
-
-// runNumericOverflowMigration fixes the numeric field overflow issue (Issue #29)
-// This migration changes request_time and upstream_response_time from NUMERIC(10,6) to DOUBLE PRECISION
-func (db *DB) runNumericOverflowMigration() error {
-	const migrationVersion = "006_fix_numeric_overflow"
-
-	// Check if already migrated
-	var migrated bool
-	err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, migrationVersion).Scan(&migrated)
-	if err != nil {
-		return fmt.Errorf("failed to check migration status: %w", err)
-	}
-	if migrated {
-		log.Printf("[Migration] %s already applied", migrationVersion)
-		return nil
-	}
-
-	// Check if logs_partitioned table exists
-	var tableExists bool
-	err = db.QueryRow(`
-		SELECT EXISTS(
-			SELECT 1 FROM information_schema.tables
-			WHERE table_schema = 'public' AND table_name = 'logs_partitioned'
-		)
-	`).Scan(&tableExists)
-	if err != nil || !tableExists {
-		log.Printf("[Migration] logs_partitioned table not found, skipping %s", migrationVersion)
-		// Mark as applied since new installations already have DOUBLE PRECISION
-		db.Exec(`INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, migrationVersion)
-		return nil
-	}
-
-	// Check current column type
-	var dataType string
-	err = db.QueryRow(`
-		SELECT data_type
-		FROM information_schema.columns
-		WHERE table_schema = 'public' AND table_name = 'logs_partitioned' AND column_name = 'request_time'
-	`).Scan(&dataType)
-	if err != nil {
-		return fmt.Errorf("failed to check column type: %w", err)
-	}
-
-	// If already DOUBLE PRECISION, mark as migrated and skip
-	if dataType == "double precision" {
-		log.Printf("[Migration] request_time already uses double precision, marking %s as applied", migrationVersion)
-		db.Exec(`INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, migrationVersion)
-		return nil
-	}
-
-	log.Printf("[Migration] Starting %s: changing NUMERIC to DOUBLE PRECISION...", migrationVersion)
-	log.Printf("[Migration] Current request_time type: %s", dataType)
-
-	// Check if this is a TimescaleDB hypertable
-	isHypertable := db.isHypertable("logs_partitioned")
-
-	if isHypertable {
-		log.Println("[Migration] logs_partitioned is a TimescaleDB hypertable, handling compression...")
-
-		// Step 1: Decompress all chunks
-		log.Println("[Migration] Decompressing compressed chunks...")
-		_, err = db.Exec(`
-			DO $$
-			DECLARE
-				chunk_record RECORD;
-				decompressed_count INT := 0;
-			BEGIN
-				FOR chunk_record IN
-					SELECT format('%I.%I', chunk_schema, chunk_name) as full_name
-					FROM timescaledb_information.chunks
-					WHERE hypertable_name = 'logs_partitioned' AND is_compressed = true
-				LOOP
-					EXECUTE format('SELECT decompress_chunk(%L, true)', chunk_record.full_name);
-					decompressed_count := decompressed_count + 1;
-					RAISE NOTICE 'Decompressed: %', chunk_record.full_name;
-				END LOOP;
-				RAISE NOTICE 'Total chunks decompressed: %', decompressed_count;
-			END;
-			$$
-		`)
-		if err != nil {
-			log.Printf("[Migration] Warning: error during decompression (may be no compressed chunks): %v", err)
-		}
-
-		// Step 2: Disable compression temporarily
-		log.Println("[Migration] Disabling compression temporarily...")
-		_, err = db.Exec(`ALTER TABLE logs_partitioned SET (timescaledb.compress = false)`)
-		if err != nil {
-			log.Printf("[Migration] Warning: failed to disable compression: %v", err)
-		}
-	}
-
-	// Step 3: Alter column types to DOUBLE PRECISION
-	log.Println("[Migration] Altering column types to DOUBLE PRECISION...")
-	_, err = db.Exec(`
-		ALTER TABLE logs_partitioned
-			ALTER COLUMN request_time TYPE DOUBLE PRECISION,
-			ALTER COLUMN upstream_response_time TYPE DOUBLE PRECISION
-	`)
-	if err != nil {
-		return fmt.Errorf("failed to alter column types: %w", err)
-	}
-	log.Println("[Migration] Column types changed successfully")
-
-	if isHypertable {
-		// Step 4: Re-enable compression with same settings
-		log.Println("[Migration] Re-enabling compression...")
-		_, err = db.Exec(`
-			ALTER TABLE logs_partitioned SET (
-				timescaledb.compress,
-				timescaledb.compress_segmentby = 'host, log_type',
-				timescaledb.compress_orderby = 'created_at DESC'
-			)
-		`)
-		if err != nil {
-			log.Printf("[Migration] Warning: failed to re-enable compression: %v", err)
-		}
-
-		// Step 5: Recompress old chunks (optional, in background)
-		log.Println("[Migration] Recompressing chunks older than 7 days in background...")
-		go func() {
-			time.Sleep(5 * time.Second)
-			_, err := db.Exec(`SELECT compress_chunk(c) FROM show_chunks('logs_partitioned', older_than => INTERVAL '7 days') c`)
-			if err != nil {
-				log.Printf("[Migration] Warning: background recompression had issues: %v", err)
-			} else {
-				log.Println("[Migration] Background recompression completed")
-			}
-		}()
-	}
-
-	// Mark migration as complete
-	_, err = db.Exec(`INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, migrationVersion)
-	if err != nil {
-		return fmt.Errorf("failed to record migration: %w", err)
-	}
-
-	log.Printf("[Migration] %s completed successfully!", migrationVersion)
-	return nil
-}
-
-// runPartitionTimezoneMigration fixes the partition timezone detection bug (Issue #38 related)
-// The original 007 migration incorrectly detected local timezone when pg_get_expr()
-// displays UTC timestamps in the session's timezone (e.g., +00 shown as +09 in KST)
-func (db *DB) runPartitionTimezoneMigration() error {
-	const migrationVersion = "008_fix_partition_timezone_v2"
-
-	// Check if already migrated
-	var migrated bool
-	err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, migrationVersion).Scan(&migrated)
-	if err != nil {
-		return fmt.Errorf("failed to check migration status: %w", err)
-	}
-	if migrated {
-		log.Printf("[Migration] %s already applied", migrationVersion)
-		return nil
-	}
-
-	log.Printf("[Migration] Starting %s: fixing partition timezone detection...", migrationVersion)
-
-	// Read and execute the migration file
-	content, err := migrationFS.ReadFile("migrations/008_fix_partition_timezone_v2.sql")
-	if err != nil {
-		return fmt.Errorf("failed to read 008_fix_partition_timezone_v2.sql: %w", err)
-	}
-
-	_, err = db.Exec(string(content))
-	if err != nil {
-		log.Printf("[Migration] Warning: %s had issues (may be partially applied): %v", migrationVersion, err)
-		// Continue anyway - the function replacement should still work
-	}
-
-	// Mark migration as complete
-	_, err = db.Exec(`INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, migrationVersion)
-	if err != nil {
-		return fmt.Errorf("failed to record migration: %w", err)
-	}
-
-	log.Printf("[Migration] %s completed successfully!", migrationVersion)
-	return nil
-}
-
-// runPregeneratePartitionsMigration pre-generates partitions for 10 years
-// This avoids timezone-related bugs from dynamic partition creation
-func (db *DB) runPregeneratePartitionsMigration() error {
-	const migrationVersion = "009_pregenerate_partitions"
-
-	// Check if already migrated
-	var migrated bool
-	err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, migrationVersion).Scan(&migrated)
-	if err != nil {
-		return fmt.Errorf("failed to check migration status: %w", err)
-	}
-	if migrated {
-		log.Printf("[Migration] %s already applied", migrationVersion)
-		return nil
-	}
-
-	log.Printf("[Migration] Starting %s: pre-generating partitions for 10 years...", migrationVersion)
-
-	// Read and execute the migration file
-	content, err := migrationFS.ReadFile("migrations/009_pregenerate_partitions.sql")
-	if err != nil {
-		return fmt.Errorf("failed to read 009_pregenerate_partitions.sql: %w", err)
-	}
-
-	_, err = db.Exec(string(content))
-	if err != nil {
-		log.Printf("[Migration] Warning: %s had issues (may be partially applied): %v", migrationVersion, err)
-		// Continue anyway - partitions may be partially created
-	}
-
-	// Mark migration as complete
-	_, err = db.Exec(`INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, migrationVersion)
-	if err != nil {
-		return fmt.Errorf("failed to record migration: %w", err)
-	}
-
-	log.Printf("[Migration] %s completed successfully!", migrationVersion)
-	return nil
-}
-
-// runHypertableNumericFixMigration fixes numeric type that was reintroduced by TimescaleDB migration (Issue #55)
-// The migrateToTimescaleDB() function previously created logs_hypertable with numeric(10,6),
-// which overrode the double precision fix from migration 006.
-func (db *DB) runHypertableNumericFixMigration() error {
-	const migrationVersion = "010_fix_hypertable_numeric"
-
-	// Check if already migrated
-	var migrated bool
-	err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = $1)`, migrationVersion).Scan(&migrated)
-	if err != nil {
-		return fmt.Errorf("failed to check migration status: %w", err)
-	}
-	if migrated {
-		log.Printf("[Migration] %s already applied", migrationVersion)
-		return nil
-	}
-
-	log.Printf("[Migration] Starting %s: fixing hypertable numeric type...", migrationVersion)
-
-	// Read and execute the migration file
-	content, err := migrationFS.ReadFile("migrations/010_fix_hypertable_numeric.sql")
-	if err != nil {
-		return fmt.Errorf("failed to read 010_fix_hypertable_numeric.sql: %w", err)
-	}
-
-	_, err = db.Exec(string(content))
-	if err != nil {
-		log.Printf("[Migration] Warning: %s had issues (may be partially applied): %v", migrationVersion, err)
-	}
-
-	// Recompress old chunks in background if applicable
-	if db.isTimescaleDBAvailable() && db.isHypertable("logs_partitioned") {
-		go func() {
-			time.Sleep(5 * time.Second)
-			_, err := db.Exec(`SELECT compress_chunk(c) FROM show_chunks('logs_partitioned', older_than => INTERVAL '7 days') c`)
-			if err != nil {
-				log.Printf("[Migration] Warning: background recompression after 010 had issues: %v", err)
-			} else {
-				log.Println("[Migration] Background recompression after 010 completed")
-			}
-		}()
-	}
-
-	// Mark migration as complete
-	_, err = db.Exec(`INSERT INTO schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING`, migrationVersion)
-	if err != nil {
-		return fmt.Errorf("failed to record migration: %w", err)
-	}
-
-	log.Printf("[Migration] %s completed successfully!", migrationVersion)
-	return nil
-}
-
-// logsPartitionedIndexes is the canonical index set the LIVE logs_partitioned
-// table must carry (mirrors the 001_init.sql definitions + upgradeSQL
-// additions + the pg_trgm search indexes).
-//
-// Why this exists: the background hypertable migration creates a NEW table
-// (with only the four idx_logs_ht_* basics) and renames the original to
-// logs_partitioned_backup — which keeps every original idx_logs_part_* index
-// NAME. From then on, every `CREATE INDEX IF NOT EXISTS idx_logs_part_*`
-// (upgradeSQL and the old one-shot 011_trgm_indexes) silently no-ops because
-// the name exists — on the wrong table. Upgraded installs ended up running
-// the hypertable with almost no indexes. ensureLogsPartitionedIndexes
-// reclaims squatted names from the backup table and builds the indexes on the
-// live table; it runs after the hypertable swap and on every boot thereafter
-// (cheap catalog lookups when everything is in place).
-//
-// Seven indexes 001_init.sql and older upgrades declare are no longer part of
-// the set; see retiredLogsPartitionedIndexes.
-var logsPartitionedIndexes = []struct {
-	Name  string
-	Def   string // USING clause + column list
-	Where string // optional partial-index predicate (must come after WITH)
-}{
-	{"idx_logs_part_host", "USING btree (host)", ""},
-	{"idx_logs_partitioned_exploit_rule", "USING btree (exploit_rule)", "exploit_rule IS NOT NULL AND exploit_rule::text <> '-'"},
-	{"idx_logs_part_client_ip", "USING btree (client_ip)", ""},
-	{"idx_logs_part_created_at", "USING btree (created_at DESC)", ""},
-	{"idx_logs_part_proxy_host_ts", `USING btree (proxy_host_id, "timestamp" DESC)`, "proxy_host_id IS NOT NULL"},
-	{"idx_logs_part_geo_ts", `USING btree (geo_country_code, "timestamp" DESC)`, "geo_country_code IS NOT NULL AND geo_country_code::text <> ''"},
-	{"idx_logs_part_type_created", "USING btree (log_type, created_at DESC)", ""},
-	{"idx_logs_part_block_reason", "USING btree (block_reason)", "block_reason != 'none'"},
-	{"idx_logs_part_status_created", "USING btree (status_code, created_at)", ""},
-	{"idx_logs_part_block_reason_created", "USING btree (created_at DESC, block_reason)", "block_reason != 'none' AND log_type = 'access'"},
-	{"idx_logs_part_host_trgm", "USING gin (host gin_trgm_ops)", ""},
-	{"idx_logs_part_uri_trgm", "USING gin (request_uri gin_trgm_ops)", ""},
-	{"idx_logs_part_ua_trgm", "USING gin (http_user_agent gin_trgm_ops)", ""},
-}
-
-// retiredLogsPartitionedIndexes are logs_partitioned indexes NPG no longer
-// builds, dropped where an earlier version built them. Measured on an
-// attack-day mix (3M rows), no filter, sort, dashboard or autocomplete query
-// got slower without them once the time sort reads created_at (see List), and
-// the sparse indexes TimescaleDB derives for compressed chunks came out the
-// same. Each one cost space on every uncompressed day (about 377 MB a day
-// together on the busiest install) and a write on every insert.
-//
-// Never list idx_logs_ht_* or logs_hypertable_created_at_idx here. Each has an
-// identical canonical twin (idx_logs_part_host, idx_logs_part_created_at,
-// idx_logs_part_type_created, idx_logs_partitioned_exploit_rule), and a chunk
-// created after both existed carries ONE physical index for the pair, owned by
-// whichever was created first: dropping the owner leaves that chunk without the
-// index its twin still promises. retireLogsPartitionedIndexes refuses any drop
-// that has such a twin.
-var retiredLogsPartitionedIndexes = []struct {
-	Name   string
-	Reason string
-}{
-	{"idx_logs_part_log_type", "idx_logs_part_type_created leads with log_type"},
-	{"idx_logs_part_timestamp", "the time sort reads created_at"},
-	{"idx_logs_part_type_timestamp", "idx_logs_part_type_created serves log_type in time order"},
-	{"idx_logs_part_host_ts", "idx_logs_part_host serves the host filter"},
-	{"idx_logs_part_status_ts", "idx_logs_part_status_created serves the status filter"},
-	{"idx_logs_part_status_code", "partial, so it cannot serve the status sort; idx_logs_part_status_created serves both"},
-	{"idx_logs_part_block_reason_ts", "idx_logs_part_block_reason and idx_logs_part_block_reason_created serve the block filters"},
-}
-
-// indexDefWithoutName is an index's definition with its name cut out, so two
-// indexes built alike on the same table compare equal.
-const indexDefWithoutName = `regexp_replace(pg_get_indexdef(i.indexrelid), '^CREATE (UNIQUE )?INDEX \S+ ON ', '')`
-
-// retireLogsPartitionedIndexes drops the retired indexes where they exist. Each
-// DROP runs in its own transaction under a short lock_timeout: DROP INDEX locks
-// the hypertable and every chunk exclusively, so a drop that cannot get its
-// locks at once rolls back whole and is tried again on the next boot instead of
-// holding log inserts behind it.
-func (db *DB) retireLogsPartitionedIndexes() {
-	retired := make([]string, len(retiredLogsPartitionedIndexes))
-	for i, idx := range retiredLogsPartitionedIndexes {
-		retired[i] = idx.Name
-	}
-	for _, idx := range retiredLogsPartitionedIndexes {
-		var onTable, def string
-		err := db.QueryRow(`
-			SELECT c.relname, `+indexDefWithoutName+`
-			FROM pg_index i
-			JOIN pg_class ic ON ic.oid = i.indexrelid
-			JOIN pg_namespace n ON n.oid = ic.relnamespace
-			JOIN pg_class c ON c.oid = i.indrelid
-			WHERE n.nspname = 'public' AND ic.relname = $1`, idx.Name).Scan(&onTable, &def)
-		if err == sql.ErrNoRows {
-			continue // never built here, or already retired
-		}
-		if err != nil {
-			log.Printf("[Migration] Warning: could not check retired index %s: %v", idx.Name, err)
-			continue
-		}
-		if onTable != "logs_partitioned" && onTable != "logs_partitioned_backup" {
-			log.Printf("[Migration] Warning: retired index name %s is on unexpected table %q; leaving it alone", idx.Name, onTable)
-			continue
-		}
-
-		// An identical index that stays may share this one's physical chunk
-		// indexes; see retiredLogsPartitionedIndexes. Identical retired
-		// indexes do not count: neither of them stays.
-		var twins int
-		if err := db.QueryRow(`
-			SELECT count(*)
-			FROM pg_index i
-			JOIN pg_class ic ON ic.oid = i.indexrelid
-			WHERE i.indrelid = to_regclass('public.logs_partitioned')
-			  AND ic.relname <> ALL($1)
-			  AND `+indexDefWithoutName+` = $2`, pq.Array(retired), def).Scan(&twins); err != nil {
-			log.Printf("[Migration] Warning: could not check %s for an identical index: %v", idx.Name, err)
-			continue
-		}
-		if twins > 0 {
-			log.Printf("[Migration] Not retiring %s: an identical index stays on logs_partitioned and may own the only physical index on newer chunks", idx.Name)
-			continue
-		}
-
-		err = func() error {
-			tx, err := db.Begin()
-			if err != nil {
-				return err
-			}
-			defer tx.Rollback()
-			if _, err := tx.Exec(`SET LOCAL lock_timeout = '3s'`); err != nil {
-				return err
-			}
-			if _, err := tx.Exec(`DROP INDEX IF EXISTS public.` + pq.QuoteIdentifier(idx.Name)); err != nil {
-				return err
-			}
-			return tx.Commit()
-		}()
-		if err != nil {
-			log.Printf("[Migration] Retiring index %s deferred to the next boot: %v", idx.Name, err)
-			continue
-		}
-		log.Printf("[Migration] Retired index %s on %s (%s)", idx.Name, onTable, idx.Reason)
-	}
-}
-
-// ensureLogsPartitionedIndexes verifies every canonical index exists ON the
-// live logs_partitioned table, reclaiming names squatted by
-// logs_partitioned_backup (the backup exists only for operator verification
-// and does not need indexes). Heavy builds use TimescaleDB's
-// transaction_per_chunk so ingest stays mostly unblocked on large installs.
-// It first drops the retired indexes (retireLogsPartitionedIndexes); every
-// caller goes through here.
-func (db *DB) ensureLogsPartitionedIndexes() {
-	db.retireLogsPartitionedIndexes()
-
-	var isHypertable bool
-	_ = db.QueryRow(`SELECT EXISTS (
-		SELECT 1 FROM timescaledb_information.hypertables
-		WHERE hypertable_name = 'logs_partitioned'
-	)`).Scan(&isHypertable)
-
-	created := 0
-	for _, idx := range logsPartitionedIndexes {
-		// Join pg_index for indisvalid: a CREATE INDEX interrupted partway (build
-		// failure, or process restart mid-build — Close() waits only 5s) leaves an
-		// INVALID index whose NAME exists. A name-only check (pg_indexes) would
-		// treat it as present and never rebuild it, stranding an unusable index
-		// forever. Detect indisvalid=false on the live table and DROP+recreate.
-		var onTable string
-		var valid bool
-		err := db.QueryRow(
-			`SELECT c.relname, i.indisvalid
-			   FROM pg_index i
-			   JOIN pg_class ic ON ic.oid = i.indexrelid
-			   JOIN pg_namespace n ON n.oid = ic.relnamespace
-			   JOIN pg_class c ON c.oid = i.indrelid
-			  WHERE n.nspname = 'public' AND ic.relname = $1`,
-			idx.Name,
-		).Scan(&onTable, &valid)
-		switch {
-		case err == nil && onTable == "logs_partitioned" && valid:
-			continue // already on the live table and usable
-		case err == nil && onTable == "logs_partitioned" && !valid:
-			// Invalid index latched on the live table — drop so it gets rebuilt.
-			if _, dropErr := db.Exec(fmt.Sprintf(`DROP INDEX IF EXISTS public.%s`, idx.Name)); dropErr != nil {
-				log.Printf("[Migration] Warning: could not drop invalid index %s for rebuild: %v", idx.Name, dropErr)
-				continue
-			}
-			log.Printf("[Migration] Dropped invalid index %s on logs_partitioned for rebuild", idx.Name)
-		case err == nil && onTable == "logs_partitioned_backup":
-			if _, dropErr := db.Exec(fmt.Sprintf(`DROP INDEX IF EXISTS public.%s`, idx.Name)); dropErr != nil {
-				log.Printf("[Migration] Warning: could not reclaim index name %s from backup table: %v", idx.Name, dropErr)
-				continue
-			}
-			log.Printf("[Migration] Reclaimed index name %s from logs_partitioned_backup", idx.Name)
-		case err == nil:
-			log.Printf("[Migration] Warning: index %s exists on unexpected table %q; leaving it alone", idx.Name, onTable)
-			continue
-		case err != sql.ErrNoRows:
-			log.Printf("[Migration] Warning: could not check index %s: %v", idx.Name, err)
-			continue
-		}
-
-		stmt := fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON logs_partitioned %s", idx.Name, idx.Def)
-		if isHypertable {
-			stmt += " WITH (timescaledb.transaction_per_chunk)"
-		}
-		if idx.Where != "" {
-			stmt += " WHERE " + idx.Where
-		}
-		if _, err := db.Exec(stmt); err != nil {
-			// transaction_per_chunk is best-effort; retry as a plain build.
-			plain := fmt.Sprintf("CREATE INDEX IF NOT EXISTS %s ON logs_partitioned %s", idx.Name, idx.Def)
-			if idx.Where != "" {
-				plain += " WHERE " + idx.Where
-			}
-			if _, err2 := db.Exec(plain); err2 != nil {
-				log.Printf("[Migration] Warning: failed to create index %s: %v (plain retry: %v)", idx.Name, err, err2)
-				continue
-			}
-		}
-		created++
-		log.Printf("[Migration] Created index %s on logs_partitioned", idx.Name)
-	}
-
-	if created > 0 {
-		log.Printf("[Migration] logs_partitioned index ensure: %d index(es) built", created)
-	}
-}
-
-// runTrgmIndexMigration enables pg_trgm and ensures the canonical
-// logs_partitioned index set. When the background hypertable migration has
-// not happened yet it defers entirely — building indexes on the pre-swap
-// table would strand them on the future backup table (the original bug that
-// left upgraded installs without indexes). The ensure pass runs in the
-// background: GIN/trgm builds over a large hypertable can take a long time
-// and must not block boot.
-func (db *DB) runTrgmIndexMigration() error {
-	// Enable pg_trgm extension
-	if _, err := db.Exec("CREATE EXTENSION IF NOT EXISTS pg_trgm"); err != nil {
-		return fmt.Errorf("failed to create pg_trgm extension: %w", err)
-	}
-
-	var swapped bool
-	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 'timescaledb_hypertable')`).Scan(&swapped); err != nil {
-		return fmt.Errorf("failed to check hypertable migration status: %w", err)
-	}
-	// Defer only when the swap genuinely hasn't happened yet — building indexes
-	// on the pre-swap logs_partitioned would strand them on the future backup
-	// table. But if logs_partitioned is ALREADY a hypertable (e.g. a prior boot
-	// completed the swap but never recorded the marker, or migrateToTimescaleDB
-	// took its "hypertable already exists" early-return path), deferring would
-	// wait on a migration that returns without ever calling ensure — leaving the
-	// trgm/search indexes permanently unbuilt. Detect that and ensure directly.
-	if !swapped && db.isTimescaleDBAvailable() && !db.isHypertable("logs_partitioned") {
-		log.Println("[Migration] Deferring logs_partitioned index ensure until the hypertable migration completes")
-		return nil
-	}
-
-	db.TrackBackground()
-	go func() {
-		defer db.BackgroundDone()
-		db.ensureLogsPartitionedIndexes()
-	}()
-	return nil
-}
-
-// ExploitRulesAutoDisableSQL is the one-shot UPDATE + system_logs entry used by
-// RunMigrations (embedded inside upgradeSQL) and by integration tests that need
-// to exercise the migration independently. It is safe to run repeatedly:
-// - ADD COLUMN IF NOT EXISTS is a no-op after the first run.
-// - The UPDATE filters on auto_disabled_at IS NULL, so it only touches rows the
-//   migration has not yet marked. Admins who have re-enabled the rules keep
-//   their choice.
-// See GitHub Issue #123.
-const ExploitRulesAutoDisableSQL = `
-ALTER TABLE public.exploit_block_rules ADD COLUMN IF NOT EXISTS auto_disabled_at timestamp with time zone;
-
-DO $$
-DECLARE
-    affected_count int := 0;
-BEGIN
-    UPDATE public.exploit_block_rules
-    SET enabled = false,
-        auto_disabled_at = now()
-    WHERE id IN (
-        'a5cb921c-2c10-475b-8753-a56e2af1e5ba',
-        '41d1f7bf-9179-44cb-b41a-1685ce88d965',
-        'aa90285b-2986-46f9-80e6-99946327cd24'
-    )
-    AND is_system = true
-    AND enabled = true
-    AND auto_disabled_at IS NULL;
-
-    GET DIAGNOSTICS affected_count = ROW_COUNT;
-    IF affected_count > 0 THEN
-        INSERT INTO public.system_logs (source, level, message, details, component)
-        VALUES (
-            'internal',
-            'info',
-            format('Auto-disabled %s overly-broad exploit rule(s) to prevent false positives on search/CMS endpoints. Review and optionally re-enable at /waf/exploit-rules.', affected_count),
-            jsonb_build_object(
-                'rule_ids', ARRAY[
-                    'a5cb921c-2c10-475b-8753-a56e2af1e5ba',
-                    '41d1f7bf-9179-44cb-b41a-1685ce88d965',
-                    'aa90285b-2986-46f9-80e6-99946327cd24'
-                ],
-                'reason', 'github issue #123: simple keyword matching produces false positives on legitimate search queries',
-                'rollback_hint', 'set enabled=true in the UI; the migration will not touch these rows again once auto_disabled_at is set'
-            ),
-            'exploit_rules_migration'
-        );
-    END IF;
-END $$;
-`
-
-// ApplyExploitRulesAutoDisable runs the one-shot auto-disable migration against
-// an already-open database handle. Used by integration tests to re-exercise the
-// migration after mutating the table. Production startup uses the equivalent
-// SQL embedded inside RunMigrations() upgradeSQL. Both share the exact string
-// intent documented in ExploitRulesAutoDisableSQL.
-func ApplyExploitRulesAutoDisable(db *sql.DB) error {
-	_, err := db.Exec(ExploitRulesAutoDisableSQL)
-	return err
 }

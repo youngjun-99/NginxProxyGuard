@@ -3,10 +3,12 @@ package repository
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/lib/pq"
 
+	"nginx-proxy-guard/internal/database/dialect"
 	"nginx-proxy-guard/internal/model"
 )
 
@@ -26,62 +28,77 @@ func nullFloat64(f float64) interface{} {
 	return f
 }
 
+// logColumns is the column order of every batched log insert. The row values
+// logRowValues builds follow it.
+var logColumns = []string{
+	"log_type", "timestamp", "host", "client_ip",
+	"geo_country", "geo_country_code", "geo_city", "geo_asn", "geo_org",
+	"request_method", "request_uri", "request_protocol", "status_code",
+	"body_bytes_sent", "request_time", "upstream_response_time",
+	"upstream_addr", "upstream_status",
+	"http_referer", "http_user_agent", "http_x_forwarded_for",
+	"severity", "error_message",
+	"rule_id", "rule_message", "rule_severity", "rule_data", "attack_type", "action_taken",
+	"block_reason", "bot_category", "exploit_rule",
+	"proxy_host_id", "raw_log",
+}
+
+// logRowValues binds one log in logColumns order. The NULL normalization the
+// old INSERT did with NULLIF()/COALESCE() happens here in Go — column
+// semantics are identical to createSingle.
+func logRowValues(req *model.CreateLogRequest) []interface{} {
+	timestamp := req.Timestamp
+	if timestamp.IsZero() {
+		timestamp = time.Now()
+	}
+
+	// COALESCE(NULLIF(block_reason, '')::block_reason, 'none')
+	blockReason := string(req.BlockReason)
+	if blockReason == "" {
+		blockReason = "none"
+	}
+
+	return []interface{}{
+		string(req.LogType), timestamp, nullString(req.Host), nullString(req.ClientIP),
+		nullString(req.GeoCountry), nullString(req.GeoCountryCode), nullString(req.GeoCity), nullString(req.GeoASN), nullString(req.GeoOrg),
+		nullString(req.RequestMethod), nullString(req.RequestURI), nullString(req.RequestProtocol), nullInt64(int64(req.StatusCode)),
+		nullInt64(req.BodyBytesSent), nullFloat64(req.RequestTime), nullFloat64(req.UpstreamResponseTime),
+		nullString(req.UpstreamAddr), nullString(req.UpstreamStatus),
+		nullString(req.HTTPReferer), nullString(req.HTTPUserAgent), nullString(req.HTTPXForwardedFor),
+		nullString(string(req.Severity)), nullString(req.ErrorMessage),
+		nullInt64(req.RuleID), nullString(req.RuleMessage), nullString(req.RuleSeverity), nullString(req.RuleData), nullString(req.AttackType), nullString(req.ActionTaken),
+		blockReason, nullString(req.BotCategory), nullString(req.ExploitRule),
+		nullString(req.ProxyHostID), nullString(req.RawLog),
+	}
+}
+
 // createBatchTx inserts all logs in a single transaction via the COPY protocol
 // (pq.CopyIn). Each stmt.ExecContext only appends the row to the local COPY
 // buffer, so a full flush costs one network round trip instead of one per row
 // (the previous prepared-INSERT loop paid 500 sequential round trips per
-// 500-row flush with lib/pq). The NULL normalization the old INSERT did with
-// NULLIF()/COALESCE() now happens in Go before binding — column semantics are
-// identical to createSingle.
+// 500-row flush with lib/pq).
+//
+// MySQL has no COPY; createBatchTxMySQL sends multi-row INSERTs instead, with
+// the same all-or-nothing transaction.
 func (r *LogRepository) createBatchTx(ctx context.Context, logs []model.CreateLogRequest) error {
+	if dialect.IsMySQL() {
+		return r.createBatchTxMySQL(ctx, logs)
+	}
+
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	stmt, err := tx.PrepareContext(ctx, pq.CopyIn("logs_partitioned",
-		"log_type", "timestamp", "host", "client_ip",
-		"geo_country", "geo_country_code", "geo_city", "geo_asn", "geo_org",
-		"request_method", "request_uri", "request_protocol", "status_code",
-		"body_bytes_sent", "request_time", "upstream_response_time",
-		"upstream_addr", "upstream_status",
-		"http_referer", "http_user_agent", "http_x_forwarded_for",
-		"severity", "error_message",
-		"rule_id", "rule_message", "rule_severity", "rule_data", "attack_type", "action_taken",
-		"block_reason", "bot_category", "exploit_rule",
-		"proxy_host_id", "raw_log",
-	))
+	stmt, err := tx.PrepareContext(ctx, pq.CopyIn("logs_partitioned", logColumns...))
 	if err != nil {
 		return fmt.Errorf("failed to prepare statement: %w", err)
 	}
 	defer stmt.Close()
 
-	for _, req := range logs {
-		timestamp := req.Timestamp
-		if timestamp.IsZero() {
-			timestamp = time.Now()
-		}
-
-		// COALESCE(NULLIF(block_reason, '')::block_reason, 'none')
-		blockReason := string(req.BlockReason)
-		if blockReason == "" {
-			blockReason = "none"
-		}
-
-		_, err := stmt.ExecContext(ctx,
-			string(req.LogType), timestamp, nullString(req.Host), nullString(req.ClientIP),
-			nullString(req.GeoCountry), nullString(req.GeoCountryCode), nullString(req.GeoCity), nullString(req.GeoASN), nullString(req.GeoOrg),
-			nullString(req.RequestMethod), nullString(req.RequestURI), nullString(req.RequestProtocol), nullInt64(int64(req.StatusCode)),
-			nullInt64(req.BodyBytesSent), nullFloat64(req.RequestTime), nullFloat64(req.UpstreamResponseTime),
-			nullString(req.UpstreamAddr), nullString(req.UpstreamStatus),
-			nullString(req.HTTPReferer), nullString(req.HTTPUserAgent), nullString(req.HTTPXForwardedFor),
-			nullString(string(req.Severity)), nullString(req.ErrorMessage),
-			nullInt64(req.RuleID), nullString(req.RuleMessage), nullString(req.RuleSeverity), nullString(req.RuleData), nullString(req.AttackType), nullString(req.ActionTaken),
-			blockReason, nullString(req.BotCategory), nullString(req.ExploitRule),
-			nullString(req.ProxyHostID), nullString(req.RawLog),
-		)
-		if err != nil {
+	for i := range logs {
+		if _, err := stmt.ExecContext(ctx, logRowValues(&logs[i])...); err != nil {
 			return fmt.Errorf("failed to insert log: %w", err)
 		}
 	}
@@ -92,6 +109,52 @@ func (r *LogRepository) createBatchTx(ctx context.Context, logs []model.CreateLo
 	// poison row, exactly as before.
 	if _, err := stmt.ExecContext(ctx); err != nil {
 		return fmt.Errorf("failed to insert log: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+// mysqlLogInsertRows caps the rows of one multi-row INSERT. Arguments are
+// interpolated client-side, so the bound is max_allowed_packet rather than the
+// 65535-placeholder limit: 250 rows with a raw_log each stays well inside the
+// 64 MiB default.
+const mysqlLogInsertRows = 250
+
+// createBatchTxMySQL is createBatchTx for MySQL: multi-row INSERTs in one
+// transaction, so a poison row still fails the whole batch and CreateBatch's
+// mini-batch fallback isolates it exactly as on PostgreSQL.
+func (r *LogRepository) createBatchTxMySQL(ctx context.Context, logs []model.CreateLogRequest) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	quoted := make([]string, len(logColumns))
+	for i, c := range logColumns {
+		quoted[i] = "`" + c + "`"
+	}
+	head := "INSERT INTO logs_partitioned (" + strings.Join(quoted, ", ") + ") VALUES "
+	row := "(" + strings.TrimSuffix(strings.Repeat("?, ", len(logColumns)), ", ") + ")"
+
+	for start := 0; start < len(logs); start += mysqlLogInsertRows {
+		end := start + mysqlLogInsertRows
+		if end > len(logs) {
+			end = len(logs)
+		}
+		var b strings.Builder
+		b.WriteString(head)
+		args := make([]interface{}, 0, (end-start)*len(logColumns))
+		for i := start; i < end; i++ {
+			if i > start {
+				b.WriteString(", ")
+			}
+			b.WriteString(row)
+			args = append(args, logRowValues(&logs[i])...)
+		}
+		if _, err := tx.ExecContext(ctx, dialect.Raw(b.String()), args...); err != nil {
+			return fmt.Errorf("failed to insert log: %w", err)
+		}
 	}
 
 	return tx.Commit()

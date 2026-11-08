@@ -9,6 +9,7 @@ import (
 
 	"github.com/lib/pq"
 	"nginx-proxy-guard/internal/database"
+	"nginx-proxy-guard/internal/database/dialect"
 	"nginx-proxy-guard/internal/model"
 )
 
@@ -223,7 +224,14 @@ func (r *CertificateRepository) List(ctx context.Context, page, perPage int, sea
 	argIndex := 1
 
 	if search != "" {
-		conditions = append(conditions, fmt.Sprintf("array_to_string(c.domain_names, ',') ILIKE $%d", argIndex))
+		if dialect.IsMySQL() {
+			// The stored lib/pq literal without braces and quotes is what
+			// array_to_string(domain_names, ',') gives.
+			conditions = append(conditions, fmt.Sprintf(`REPLACE(SUBSTRING(c.domain_names, 2, CHAR_LENGTH(c.domain_names) - 2), '"', '') ILIKE $%d`, argIndex))
+		} else {
+			//npg:pg-only
+			conditions = append(conditions, fmt.Sprintf("array_to_string(c.domain_names, ',') ILIKE $%d", argIndex))
+		}
 		args = append(args, "%"+search+"%")
 		argIndex++
 	}

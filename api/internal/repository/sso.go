@@ -10,6 +10,7 @@ import (
 	"github.com/lib/pq"
 
 	"nginx-proxy-guard/internal/database"
+	"nginx-proxy-guard/internal/database/dialect"
 	"nginx-proxy-guard/internal/model"
 )
 
@@ -148,7 +149,7 @@ func (r *SSORepository) Create(ctx context.Context, req *model.CreateSSOProvider
 		req.CallbackBaseURL, enabled, req.AllowJIT, req.TrustProviderEmail, pq.Array(req.AllowedEmailDomains), pq.Array(req.AllowedEmails),
 		req.GroupClaim, req.RequiredGroup, req.DefaultRoleID, mappings).Scan(&id)
 	if err != nil {
-		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+		if dialect.IsUniqueViolation(err) {
 			return "", fmt.Errorf("a provider with this slug already exists")
 		}
 		return "", fmt.Errorf("failed to create sso provider: %w", err)
@@ -181,7 +182,7 @@ func (r *SSORepository) Update(ctx context.Context, id string, req *model.Update
 		req.CallbackBaseURL, enabled, req.AllowJIT, req.TrustProviderEmail, pq.Array(req.AllowedEmailDomains), pq.Array(req.AllowedEmails),
 		req.GroupClaim, req.RequiredGroup, req.DefaultRoleID, mappings)
 	if err != nil {
-		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+		if dialect.IsUniqueViolation(err) {
 			return fmt.Errorf("a provider with this slug already exists")
 		}
 		return fmt.Errorf("failed to update sso provider: %w", err)
@@ -256,7 +257,7 @@ func (r *SSORepository) LinkIdentity(ctx context.Context, providerID, subject, u
 		DO UPDATE SET email = EXCLUDED.email, last_login_at = now()`,
 		providerID, subject, userID, email)
 	if err != nil {
-		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+		if dialect.IsUniqueViolation(err) {
 			return fmt.Errorf("this account is already linked to a different identity on that provider")
 		}
 		return fmt.Errorf("failed to link identity: %w", err)
@@ -267,10 +268,18 @@ func (r *SSORepository) LinkIdentity(ctx context.Context, providerID, subject, u
 // ── login state ───────────────────────────────────────────────────────────
 
 func (r *SSORepository) SaveLoginState(ctx context.Context, state, providerID, nonce, verifier string, ttl time.Duration) error {
-	_, err := r.db.ExecContext(ctx, `
+	//npg:pg-only
+	query, ttlArg := `
 		INSERT INTO sso_login_states (state, provider_id, nonce, code_verifier, expires_at)
-		VALUES ($1,$2,$3,$4, now() + $5::interval)`,
-		state, providerID, nonce, verifier, fmt.Sprintf("%d seconds", int(ttl.Seconds())))
+		VALUES ($1,$2,$3,$4, now() + $5::interval)`, interface{}(fmt.Sprintf("%d seconds", int(ttl.Seconds())))
+	if dialect.IsMySQL() {
+		// MySQL has no interval values, only INTERVAL n unit.
+		//npg:mysql
+		query, ttlArg = dialect.Raw(`
+		INSERT INTO sso_login_states (state, provider_id, nonce, code_verifier, expires_at)
+		VALUES (?, ?, ?, ?, NOW(6) + INTERVAL ? SECOND)`), int(ttl.Seconds())
+	}
+	_, err := r.db.ExecContext(ctx, query, state, providerID, nonce, verifier, ttlArg)
 	if err != nil {
 		return fmt.Errorf("failed to save login state: %w", err)
 	}
@@ -309,8 +318,10 @@ func (r *SSORepository) DeleteExpiredLoginStates(ctx context.Context) (int64, er
 func (r *SSORepository) TablesExist(ctx context.Context) bool {
 	var ok bool
 	err := r.db.QueryRowContext(ctx,
-		`SELECT to_regclass('public.sso_providers') IS NOT NULL
+		//npg:pg-only: tablesExistQuery swaps in the MySQL form
+		tablesExistQuery(`SELECT to_regclass('public.sso_providers') IS NOT NULL
 		    AND to_regclass('public.user_identities') IS NOT NULL
-		    AND to_regclass('public.sso_login_states') IS NOT NULL`).Scan(&ok)
+		    AND to_regclass('public.sso_login_states') IS NOT NULL`,
+			"sso_providers", "user_identities", "sso_login_states")).Scan(&ok)
 	return err == nil && ok
 }

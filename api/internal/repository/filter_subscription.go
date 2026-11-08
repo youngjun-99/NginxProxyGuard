@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net"
 	"strings"
 	"time"
 
+	"nginx-proxy-guard/internal/database/dialect"
 	"nginx-proxy-guard/internal/model"
 	"nginx-proxy-guard/pkg/cache"
 )
@@ -647,6 +649,10 @@ type FilterMatch struct {
 // wants to see that a list would have matched even if it is not the one that
 // did, and the caller can tell them apart by Enabled.
 func (r *FilterSubscriptionRepository) MatchIP(ctx context.Context, ip string) ([]FilterMatch, error) {
+	if dialect.IsMySQL() {
+		return r.matchIPMySQL(ctx, ip)
+	}
+	//npg:pg-only
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT s.id, s.name, s.type, e.value, s.enabled, COALESCE(e.reason, '')
 		FROM filter_subscription_entries e
@@ -662,6 +668,51 @@ func (r *FilterSubscriptionRepository) MatchIP(ctx context.Context, ip string) (
 	}
 	defer rows.Close()
 	return scanFilterMatches(rows)
+}
+
+// matchIPMySQL is MatchIP on MySQL, which has no inet type to test a range
+// with: exact entries are matched in SQL, and the ranges of the address's own
+// family are read and tested in Go with the same containment PostgreSQL's <<=
+// applies. A stored range that does not parse matches nothing (PostgreSQL
+// would fail the whole lookup on it). This is an on-demand diagnostic, so
+// reading a list's ranges is affordable.
+func (r *FilterSubscriptionRepository) matchIPMySQL(ctx context.Context, ip string) ([]FilterMatch, error) {
+	addr := net.ParseIP(strings.TrimSpace(ip))
+	family := "NOT LIKE '%:%'"
+	if addr != nil && addr.To4() == nil {
+		family = "LIKE '%:%'"
+	}
+	//npg:mysql
+	rows, err := r.db.QueryContext(ctx, dialect.Raw(`
+		SELECT s.id, s.name, s.type, e.value, s.enabled, COALESCE(e.reason, '')
+		FROM filter_subscription_entries e
+		JOIN filter_subscriptions s ON s.id = e.subscription_id
+		WHERE s.type IN ('ip', 'cidr')
+		  AND (
+		    (LOCATE('/', e.value) = 0 AND e.value = ?)
+		    OR (LOCATE('/', e.value) > 0 AND e.value `+family+`)
+		  )
+		ORDER BY s.enabled DESC, s.name`), ip)
+	if err != nil {
+		return nil, fmt.Errorf("failed to match ip against subscriptions: %w", err)
+	}
+	defer rows.Close()
+	matches, err := scanFilterMatches(rows)
+	if err != nil {
+		return nil, err
+	}
+	out := matches[:0]
+	for _, m := range matches {
+		if !strings.Contains(m.MatchedValue, "/") {
+			out = append(out, m)
+			continue
+		}
+		if _, network, err := net.ParseCIDR(m.MatchedValue); err == nil && addr != nil && network.Contains(addr) &&
+			(addr.To4() != nil) == (network.IP.To4() != nil) {
+			out = append(out, m)
+		}
+	}
+	return out, nil
 }
 
 // MatchUserAgent answers the same question for a user-agent block. The stored

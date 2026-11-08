@@ -11,6 +11,7 @@ import (
 	"github.com/lib/pq"
 
 	"nginx-proxy-guard/internal/database"
+	"nginx-proxy-guard/internal/database/dialect"
 	"nginx-proxy-guard/internal/model"
 )
 
@@ -35,9 +36,11 @@ func NewNotificationRepository(db *database.DB) *NotificationRepository {
 func (r *NotificationRepository) TablesExist(ctx context.Context) (bool, error) {
 	var ok bool
 	err := r.db.QueryRowContext(ctx,
-		`SELECT to_regclass('public.notification_channels') IS NOT NULL
+		//npg:pg-only: tablesExistQuery swaps in the MySQL form
+		tablesExistQuery(`SELECT to_regclass('public.notification_channels') IS NOT NULL
 		    AND to_regclass('public.notification_state') IS NOT NULL
-		    AND to_regclass('public.notification_outbox') IS NOT NULL`).Scan(&ok)
+		    AND to_regclass('public.notification_outbox') IS NOT NULL`,
+			"notification_channels", "notification_state", "notification_outbox")).Scan(&ok)
 	if err != nil {
 		return false, fmt.Errorf("failed to check the notification tables: %w", err)
 	}
@@ -119,9 +122,15 @@ func (r *NotificationRepository) GetByID(ctx context.Context, id string) (*model
 // containment test happens in the database so a busy event does not pull every
 // channel into Go on every emission.
 func (r *NotificationRepository) ChannelsForEvent(ctx context.Context, eventKey string) ([]model.NotificationChannel, error) {
+	// MySQL has no array containment; for a single element it is membership.
+	//npg:pg-only
+	cond := `events @> ARRAY[$1]::text[]`
+	if dialect.IsMySQL() {
+		cond = `$1 = ANY(events)`
+	}
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT `+channelColumns+` FROM notification_channels
-		 WHERE enabled AND events @> ARRAY[$1]::text[] ORDER BY name`, eventKey)
+		 WHERE enabled AND `+cond+` ORDER BY name`, eventKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to select channels for %s: %w", eventKey, err)
 	}
@@ -151,10 +160,17 @@ func (r *NotificationRepository) ChannelsForDigest(ctx context.Context, hour int
 // a new one when a group is upgraded to a supergroup, and the old id stops
 // working, so persisting it is what keeps the channel alive across the upgrade.
 func (r *NotificationRepository) SetChatID(ctx context.Context, channelID, chatID string) error {
-	_, err := r.db.ExecContext(ctx,
-		`UPDATE notification_channels
+	//npg:pg-only
+	query, args := `UPDATE notification_channels
 		 SET config = jsonb_set(config, '{chat_id}', to_jsonb($2::text)), updated_at = now()
-		 WHERE id = $1`, channelID, chatID)
+		 WHERE id = $1`, []interface{}{channelID, chatID}
+	if dialect.IsMySQL() {
+		//npg:mysql
+		query, args = dialect.Raw(`UPDATE notification_channels
+		 SET config = JSON_SET(config, '$.chat_id', ?), updated_at = NOW(6)
+		 WHERE id = ?`), []interface{}{chatID, channelID}
+	}
+	_, err := r.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return fmt.Errorf("failed to store migrated chat id: %w", err)
 	}
@@ -186,7 +202,7 @@ func (r *NotificationRepository) Create(ctx context.Context, req *model.CreateNo
 		req.Name, req.Type, enabled, config, pq.Array(req.Events), pq.Array(req.DigestEvents),
 		req.RichFormat, req.Language, req.DashboardURL, req.DigestEnabled, req.DigestHour, req.AllowPrivateTarget, req.Template).Scan(&id)
 	if err != nil {
-		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+		if dialect.IsUniqueViolation(err) {
 			return "", fmt.Errorf("a channel with this name already exists")
 		}
 		return "", fmt.Errorf("failed to create notification channel: %w", err)
@@ -215,7 +231,7 @@ func (r *NotificationRepository) Update(ctx context.Context, id string, req *mod
 		id, req.Name, req.Type, enabled, config, pq.Array(req.Events), pq.Array(req.DigestEvents),
 		req.RichFormat, req.Language, req.DashboardURL, req.DigestEnabled, req.DigestHour, req.AllowPrivateTarget, req.Template)
 	if err != nil {
-		if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23505" {
+		if dialect.IsUniqueViolation(err) {
 			return fmt.Errorf("a channel with this name already exists")
 		}
 		return fmt.Errorf("failed to update notification channel: %w", err)
@@ -375,9 +391,14 @@ func (r *NotificationRepository) EnqueueForDigest(ctx context.Context, channelID
 // only. digest_enabled is required because a channel with the summary switched
 // off has nowhere to put it.
 func (r *NotificationRepository) ChannelsForDigestEvent(ctx context.Context, eventKey string) ([]model.NotificationChannel, error) {
+	//npg:pg-only
+	cond := `digest_events @> ARRAY[$1]::text[]`
+	if dialect.IsMySQL() {
+		cond = `$1 = ANY(digest_events)`
+	}
 	rows, err := r.db.QueryContext(ctx,
 		`SELECT `+channelColumns+` FROM notification_channels
-		 WHERE enabled AND digest_enabled AND digest_events @> ARRAY[$1]::text[] ORDER BY name`, eventKey)
+		 WHERE enabled AND digest_enabled AND `+cond+` ORDER BY name`, eventKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to select digest channels for %s: %w", eventKey, err)
 	}
@@ -397,13 +418,33 @@ type DigestPending struct {
 
 // PendingDigestItems groups a channel's parked occurrences for rendering.
 func (r *NotificationRepository) PendingDigestItems(ctx context.Context, channelID string, since time.Time) ([]DigestPending, error) {
-	rows, err := r.db.QueryContext(ctx, `
+	//npg:pg-only
+	query := `
 		SELECT event_key, count(*), max(created_at),
 		       COALESCE((array_agg(payload->'fields'->>'subject' ORDER BY created_at DESC))[1], '')
 		FROM notification_outbox
 		WHERE channel_id = $1 AND status = $2 AND created_at >= $3
 		GROUP BY event_key
-		ORDER BY count(*) DESC, event_key`, channelID, outboxStatusDigest, since)
+		ORDER BY count(*) DESC, event_key`
+	if dialect.IsMySQL() {
+		// The subject of each group's newest row, NULL kept as NULL as the
+		// array subscript keeps it: ROW_NUMBER() picks the row, and a JSON
+		// null reads as SQL NULL as it does through ->>.
+		//npg:mysql
+		query = dialect.Raw(`
+		SELECT event_key, COUNT(*), MAX(created_at), COALESCE(MAX(CASE WHEN rn = 1 THEN subject END), '')
+		FROM (
+			SELECT event_key, created_at,
+			       CASE WHEN JSON_TYPE(JSON_EXTRACT(payload, '$.fields.subject')) = 'NULL' THEN NULL
+			            ELSE JSON_UNQUOTE(JSON_EXTRACT(payload, '$.fields.subject')) END AS subject,
+			       ROW_NUMBER() OVER (PARTITION BY event_key ORDER BY created_at DESC) AS rn
+			FROM notification_outbox
+			WHERE channel_id = ? AND status = ? AND created_at >= ?
+		) o
+		GROUP BY event_key
+		ORDER BY COUNT(*) DESC, event_key`)
+	}
+	rows, err := r.db.QueryContext(ctx, query, channelID, outboxStatusDigest, since)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read parked digest items: %w", err)
 	}
@@ -460,10 +501,18 @@ func (r *NotificationRepository) FailQueuedForDisabledChannel(ctx context.Contex
 // yesterday's alerts as if they had just happened, which is worse than not
 // delivering them: the operator goes looking for a problem that is over.
 func (r *NotificationRepository) ExpireStaleQueued(ctx context.Context, maxAge time.Duration, reason string) (int64, error) {
-	res, err := r.db.ExecContext(ctx,
-		`UPDATE notification_outbox SET status = 'failed', last_error = $2
+	//npg:pg-only
+	query, args := `UPDATE notification_outbox SET status = 'failed', last_error = $2
 		 WHERE status = 'queued' AND created_at < now() - $1::interval`,
-		fmt.Sprintf("%d seconds", int(maxAge.Seconds())), reason)
+		[]interface{}{fmt.Sprintf("%d seconds", int(maxAge.Seconds())), reason}
+	if dialect.IsMySQL() {
+		// MySQL has no interval values, only INTERVAL n unit.
+		//npg:mysql
+		query, args = dialect.Raw(`UPDATE notification_outbox SET status = 'failed', last_error = ?
+		 WHERE status = 'queued' AND created_at < NOW(6) - INTERVAL ? SECOND`),
+			[]interface{}{reason, int(maxAge.Seconds())}
+	}
+	res, err := r.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return 0, fmt.Errorf("failed to expire stale notifications: %w", err)
 	}
@@ -530,6 +579,15 @@ func (r *NotificationRepository) MarkSent(ctx context.Context, id int64) error {
 }
 
 func (r *NotificationRepository) MarkRetry(ctx context.Context, id int64, in time.Duration, reason string) error {
+	if dialect.IsMySQL() {
+		//npg:mysql
+		_, err := r.db.ExecContext(ctx, dialect.Raw(`
+		UPDATE notification_outbox
+		SET attempts = attempts + 1, next_attempt_at = NOW(6) + INTERVAL ? SECOND, last_error = ?
+		WHERE id = ?`), int(in.Seconds()), reason, id)
+		return err
+	}
+	//npg:pg-only
 	_, err := r.db.ExecContext(ctx, `
 		UPDATE notification_outbox
 		SET attempts = attempts + 1, next_attempt_at = now() + $2::interval, last_error = $3
@@ -554,6 +612,17 @@ func (r *NotificationRepository) RecordChannelResult(ctx context.Context, channe
 	if failure == "" {
 		// A success re-enables a channel this counter turned off: the operator
 		// fixed the token, pressed Test, and the channel has proved it works.
+		if dialect.IsMySQL() {
+			// enabled is assigned first: MySQL evaluates a single-table SET
+			// list left to right, so after consecutive_failures = 0 the CASE
+			// would read 0 and never re-enable.
+			//npg:mysql
+			_, err := r.db.ExecContext(ctx, dialect.Raw(`UPDATE notification_channels
+			 SET enabled = CASE WHEN consecutive_failures >= 10 THEN true ELSE enabled END,
+			     last_success_at = NOW(6), consecutive_failures = 0, last_error = NULL
+			 WHERE id = ?`), channelID)
+			return false, err
+		}
 		_, err := r.db.ExecContext(ctx,
 			`UPDATE notification_channels
 			 SET last_success_at = now(), consecutive_failures = 0, last_error = NULL,
@@ -561,9 +630,13 @@ func (r *NotificationRepository) RecordChannelResult(ctx context.Context, channe
 			 WHERE id = $1`, channelID)
 		return false, err
 	}
+	if dialect.IsMySQL() {
+		return r.recordChannelFailureMySQL(ctx, channelID, failure)
+	}
 	// The previous value comes from a CTE rather than a subquery in RETURNING:
 	// both would read the pre-update snapshot, but only one of them says so.
 	var wasEnabled, nowEnabled bool
+	//npg:pg-only
 	err = r.db.QueryRowContext(ctx, `
 		WITH prev AS (SELECT enabled FROM notification_channels WHERE id = $1)
 		UPDATE notification_channels c
@@ -578,6 +651,44 @@ func (r *NotificationRepository) RecordChannelResult(ctx context.Context, channe
 		return false, nil
 	}
 	return wasEnabled && !nowEnabled, err
+}
+
+// recordChannelFailureMySQL is RecordChannelResult's failure path on MySQL,
+// which has neither UPDATE ... FROM a CTE nor RETURNING: the row is read and
+// locked first, then updated, in one transaction. Whether the channel is
+// still enabled afterwards is decided in Go from the row as read, by the same
+// rule the UPDATE applies, so the answer cannot depend on MySQL evaluating the
+// SET list left to right (a later assignment there sees the earlier one's new
+// value, where PostgreSQL's all see the old row).
+func (r *NotificationRepository) recordChannelFailureMySQL(ctx context.Context, channelID, failure string) (bool, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var wasEnabled bool
+	var failures int
+	//npg:mysql
+	err = tx.QueryRowContext(ctx, dialect.Raw(
+		`SELECT enabled, consecutive_failures FROM notification_channels WHERE id = ? FOR UPDATE`), channelID).
+		Scan(&wasEnabled, &failures)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	nowEnabled := wasEnabled && failures+1 < 10
+	//npg:mysql
+	if _, err := tx.ExecContext(ctx, dialect.Raw(`UPDATE notification_channels
+		SET last_error_at = NOW(6), last_error = ?, consecutive_failures = ?, enabled = ?
+		WHERE id = ?`), failure, failures+1, nowEnabled, channelID); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return wasEnabled && !nowEnabled, nil
 }
 
 // RecordTransientFailure notes an attempt that is going to be retried.

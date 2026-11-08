@@ -4,12 +4,12 @@ import (
 	"errors"
 	"log"
 	"net/http"
-	"strings"
 
 	"github.com/labstack/echo/v4"
 	"github.com/lib/pq"
 
 	"nginx-proxy-guard/internal/database"
+	"nginx-proxy-guard/internal/database/dialect"
 )
 
 // Postgres SQLSTATE codes. Two are mapped onto a client-facing status, both
@@ -45,6 +45,10 @@ const driverTextPrefix = database.DriverTextPrefix
 // geometry of our SQL. errors.As is the primary test (repositories wrap with
 // %w); the strings.Contains fallback catches a chain that was flattened with
 // %v somewhere and can no longer be unwrapped.
+//
+// On MySQL the same holds for go-sql-driver's *mysql.MySQLError, rendered
+// "Error <number> (<SQLSTATE>): <message>", and for a statement the translator
+// refused, whose error quotes the SQL it could not rewrite.
 func isDriverError(err error) bool {
 	if err == nil {
 		return false
@@ -53,7 +57,10 @@ func isDriverError(err error) bool {
 	if errors.As(err, &pqErr) {
 		return true
 	}
-	return strings.Contains(err.Error(), driverTextPrefix)
+	if dialect.IsMySQL() && (dialect.IsDriverError(err) || errors.Is(err, dialect.ErrUntranslatable)) {
+		return true
+	}
+	return database.HasDriverText(err.Error())
 }
 
 // SafeErrorDetail is what goes into ErrorResponse.Details. It returns "" when a
@@ -122,11 +129,9 @@ func scrubbedClientText(message string) string {
 // it a 500". Only errors.As is consulted here — never the string fallback —
 // so a status is never changed on the strength of a substring match.
 func ClientStatusForDBError(err error) (int, string, bool) {
-	var pqErr *pq.Error
-	if !errors.As(err, &pqErr) {
-		return 0, "", false
-	}
-	switch string(pqErr.Code) {
+	// dialect.SQLState reads lib/pq's code, or maps a MySQL error number onto
+	// the PostgreSQL code for the same condition; "" when err carries neither.
+	switch dialect.SQLState(err) {
 	case sqlStateInvalidTextRepresentation:
 		return http.StatusBadRequest, ErrMsgInvalidIdentifier, true
 	case sqlStateStringDataRightTruncation:

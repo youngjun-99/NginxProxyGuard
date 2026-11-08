@@ -1,0 +1,68 @@
+# Nginx Proxy Guard on MySQL 8.4 instead of TimescaleDB/PostgreSQL.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.mysql.yml up -d
+#
+# To avoid typing both files, set COMPOSE_FILE in .env:
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.mysql.yml
+#
+# The engine is chosen once, at install time. There is no migration path
+# between the two engines' data directories: to switch, start from an empty
+# database and restore an NPG backup (Settings > Backup). Backups are exported
+# and imported by the API itself, so they are engine-independent.
+#
+# What differs on MySQL (see README, "Running on MySQL"):
+#   * TimescaleDB features — chunk compression, the raw-log reclaim job and
+#     DiskGuard's emergency compression — are not available; disk-usage alerts
+#     still run. Log retention deletes old rows in batches instead of dropping
+#     chunks.
+#   * Log search with %substring% patterns scans the time range you select;
+#     PostgreSQL serves it from pg_trgm indexes.
+#
+# An existing MySQL server works too: skip this file, create a database with
+# `CREATE DATABASE nginx_proxy_guard CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`
+# and point the api at it with DATABASE_URL=mysql://user:pass@host:3306/nginx_proxy_guard.
+# MySQL 8.0.17 or later is required; NPG is tested on 8.4 LTS and 8.0.
+
+services:
+  db:
+    image: mysql:8.4
+    # Replaces the base file's postgres command line.
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_bin
+      - --default-time-zone=+00:00
+      - --max-connections=200
+      - --skip-name-resolve
+      # MySQL 8 enables the binary log by default and keeps 30 days of it. A
+      # single-node install has no replica to feed, and log ingestion would
+      # otherwise write every access-log row twice.
+      - --disable-log-bin
+      - --innodb-buffer-pool-size=${MYSQL_BUFFER_POOL:-512M}
+    environment:
+      # The base file's POSTGRES_* variables stay in the merged config; this
+      # image ignores them.
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-${DB_PASSWORD:-postgres}}
+      MYSQL_DATABASE: ${DB_NAME:-nginx_proxy_guard}
+      MYSQL_USER: ${DB_USER:-npg}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-postgres}
+    volumes:
+      # Compose merges volume lists by target path, so the base file's
+      # postgres_data mount stays alongside this one, unused and empty.
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  api:
+    environment:
+      # The mysql:// scheme selects the MySQL driver; see
+      # api/internal/database/dialect.
+      DATABASE_URL: mysql://${DB_USER:-npg}:${DB_PASSWORD:-postgres}@db:3306/${DB_NAME:-nginx_proxy_guard}
+
+volumes:
+  mysql_data:
+    name: npg_mysql_data

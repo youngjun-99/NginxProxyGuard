@@ -9,6 +9,8 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+
+	"nginx-proxy-guard/internal/database/dialect"
 )
 
 // Initial-connect retry budget. TimescaleDB crash recovery (WAL replay after
@@ -22,6 +24,13 @@ const (
 
 type DB struct {
 	*sql.DB
+
+	// kind is the engine behind this handle. Query code is almost entirely
+	// engine-agnostic — on MySQL the driver translates PostgreSQL SQL on the
+	// way out (see internal/database/dialect) — so this only decides the few
+	// paths with no mechanical translation: TimescaleDB maintenance, COPY,
+	// advisory locks, and the migration runner itself.
+	kind dialect.Kind
 
 	// bgCtx is cancelled by Close() so any background migration goroutines
 	// spawned from RunMigrations honour graceful shutdown instead of
@@ -41,8 +50,21 @@ type DB struct {
 	migLastError    string
 }
 
+// New opens the database DATABASE_URL points at. The scheme picks the engine:
+// mysql:// (or a native go-sql-driver DSN) selects MySQL, anything else is
+// PostgreSQL as before.
 func New(databaseURL string) (*DB, error) {
-	db, err := sql.Open("postgres", databaseURL)
+	kind := dialect.Detect(databaseURL)
+	driverName, dsn := "postgres", databaseURL
+	if kind == dialect.MySQL {
+		var err error
+		if dsn, err = dialect.MySQLDSN(databaseURL, false); err != nil {
+			return nil, fmt.Errorf("failed to build database DSN: %w", err)
+		}
+		driverName = dialect.DriverName
+	}
+
+	db, err := sql.Open(driverName, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database connection: %w", err)
 	}
@@ -69,9 +91,22 @@ func New(databaseURL string) (*DB, error) {
 		time.Sleep(connectRetryInterval)
 	}
 
+	// Published before any repository exists: several are built from the bare
+	// *sql.DB and read the engine from the dialect package.
+	dialect.SetActive(kind)
+	if kind == dialect.MySQL {
+		log.Printf("[DB] Connected to MySQL (%s)", dialect.Redact(databaseURL))
+	}
+
 	bgCtx, bgCancel := context.WithCancel(context.Background())
-	return &DB{DB: db, bgCtx: bgCtx, bgCancel: bgCancel}, nil
+	return &DB{DB: db, kind: kind, bgCtx: bgCtx, bgCancel: bgCancel}, nil
 }
+
+// Kind reports the engine behind this handle.
+func (db *DB) Kind() dialect.Kind { return db.kind }
+
+// IsMySQL reports whether this handle talks to MySQL.
+func (db *DB) IsMySQL() bool { return db.kind == dialect.MySQL }
 
 // RecordMigrationFailure accumulates a failed upgrade-migration statement.
 // Called from RunMigrations' per-statement warn-and-continue loop; the

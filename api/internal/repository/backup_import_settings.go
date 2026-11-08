@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/lib/pq"
+	"nginx-proxy-guard/internal/database/dialect"
 	"nginx-proxy-guard/internal/dnsentry"
 	"nginx-proxy-guard/internal/model"
 )
@@ -315,13 +316,23 @@ func mergeRestoredDNSEntryStates(ctx context.Context, store DNSEntryTx, states [
 // (#320), for the restore audit. It reads the merged rows, not what the
 // backup said.
 func (r *BackupRepository) RestoredDNSEntries(ctx context.Context) (model.DNSRestoreSummary, error) {
-	rows, err := r.db.QueryContext(ctx, `
+	//npg:pg-only
+	query := `
 		SELECT n.hostname, COALESCE(s.status, '') = $1
-		FROM (SELECT DISTINCT refs.hostname FROM (`+dnsReferenceSources+`
+		FROM (SELECT DISTINCT refs.hostname FROM (` + dnsReferenceSources + `
 		) AS refs(scope, hostname, owner_id, owner_name)) n
 		LEFT JOIN dns_entry_states s ON s.hostname = n.hostname
 		ORDER BY n.hostname
-	`, model.DNSStatusNeedsReview)
+	`
+	if dialect.IsMySQL() {
+		query = dialect.Raw(`
+		SELECT n.hostname, COALESCE(s.status, '') = ?
+		FROM (SELECT DISTINCT refs.hostname FROM (` + mysqlDNSReferenceSources + `
+		) AS refs (scope, hostname, owner_id, owner_name)) n
+		LEFT JOIN dns_entry_states s ON s.hostname = n.hostname
+		ORDER BY n.hostname`)
+	}
+	rows, err := r.db.QueryContext(ctx, query, model.DNSStatusNeedsReview)
 	if err != nil {
 		return model.DNSRestoreSummary{}, err
 	}
@@ -497,7 +508,8 @@ func (r *BackupRepository) importRoles(ctx context.Context, tx *sql.Tx, roles []
 func (r *BackupRepository) importSSOProviders(ctx context.Context, tx *sql.Tx, providers []model.SSOProviderExport) error {
 	var present bool
 	if err := tx.QueryRowContext(ctx,
-		`SELECT to_regclass('public.sso_providers') IS NOT NULL`).Scan(&present); err != nil || !present {
+		//npg:pg-only: tablesExistQuery swaps in the MySQL form
+		tablesExistQuery(`SELECT to_regclass('public.sso_providers') IS NOT NULL`, "sso_providers")).Scan(&present); err != nil || !present {
 		if len(providers) > 0 {
 			log.Printf("Backup import: skipping %d SSO providers — the sso_providers table is missing", len(providers))
 		}

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"nginx-proxy-guard/internal/database"
+	"nginx-proxy-guard/internal/database/dialect"
 )
 
 // Raw log reclaim: removing the raw_log copies of access and error lines that
@@ -92,7 +93,13 @@ func NewRawLogReclaimRepository(db *sql.DB) *RawLogReclaimRepository {
 // Support checks every catalog piece the job reads. ok=false with a reason
 // code means the job must not run here; it never guesses.
 func (r *RawLogReclaimRepository) Support(ctx context.Context) (ok bool, reason string, err error) {
+	// MySQL has no TimescaleDB: no compressed chunks, so nothing to reclaim.
+	// The card shows the job as unavailable, as on a plain PostgreSQL.
+	if dialect.IsMySQL() {
+		return false, ReclaimUnsupportedNoTimescale, nil
+	}
 	var ext bool
+	//npg:pg-only: MySQL returned above
 	if err := r.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'timescaledb')`).Scan(&ext); err != nil {
 		return false, "", fmt.Errorf("failed to check for TimescaleDB: %w", err)
 	}
@@ -100,6 +107,7 @@ func (r *RawLogReclaimRepository) Support(ctx context.Context) (ok bool, reason 
 		return false, ReclaimUnsupportedNoTimescale, nil
 	}
 	var pieces bool
+	//npg:pg-only: TimescaleDB-only; Support() reports timescaledb_missing on MySQL
 	if err := r.db.QueryRowContext(ctx, `
 		SELECT to_regclass('_timescaledb_catalog.compression_settings') IS NOT NULL
 		   AND to_regclass('timescaledb_information.chunks') IS NOT NULL
@@ -115,6 +123,7 @@ func (r *RawLogReclaimRepository) Support(ctx context.Context) (ok bool, reason 
 		return false, ReclaimUnsupportedCatalog, nil
 	}
 	var compression bool
+	//npg:pg-only: TimescaleDB-only; Support() reports timescaledb_missing on MySQL
 	err = r.db.QueryRowContext(ctx, `
 		SELECT compression_enabled FROM timescaledb_information.hypertables
 		 WHERE hypertable_schema = $1 AND hypertable_name = $2`, r.schema, r.table).Scan(&compression)
@@ -128,6 +137,7 @@ func (r *RawLogReclaimRepository) Support(ctx context.Context) (ok bool, reason 
 		return false, ReclaimUnsupportedNoCompression, nil
 	}
 	var segOK bool
+	//npg:pg-only: TimescaleDB-only; Support() reports timescaledb_missing on MySQL
 	err = r.db.QueryRowContext(ctx, `
 		SELECT COALESCE('log_type' = ANY (segmentby), false) FROM _timescaledb_catalog.compression_settings
 		 WHERE relid = to_regclass(format('%I.%I', $1::text, $2::text))`, r.schema, r.table).Scan(&segOK)
@@ -288,6 +298,7 @@ func (r *RawLogReclaimRepository) OlderSnapshots(ctx context.Context, xid int64)
 	var b SnapshotBlockers
 	var pid sql.NullInt64
 	var since sql.NullTime
+	//npg:pg-only: TimescaleDB-only; Support() reports timescaledb_missing on MySQL
 	err := r.db.QueryRowContext(ctx, `
 		WITH x AS (SELECT $1::text::xid AS v),
 		blockers AS (
@@ -326,6 +337,7 @@ func (r *RawLogReclaimRepository) OlderSnapshots(ctx context.Context, xid int64)
 func (r *RawLogReclaimRepository) HorizonNow(ctx context.Context) (int64, error) {
 	var x int64
 	if err := r.db.QueryRowContext(ctx,
+		//npg:pg-only: TimescaleDB-only; Support() reports timescaledb_missing on MySQL
 		`SELECT (pg_snapshot_xmax(pg_current_snapshot())::text::bigint - 1) % 4294967296`).Scan(&x); err != nil {
 		return 0, fmt.Errorf("failed to read the transaction horizon: %w", err)
 	}
@@ -664,6 +676,7 @@ type ReclaimPlanRow struct {
 // day stays failed, with its error; ReviveChunk gives it its one more try
 // when a run takes it.
 func (r *RawLogReclaimRepository) PlanChunk(ctx context.Context, p ReclaimPlanRow) error {
+	//npg:pg-only: TimescaleDB-only; Support() reports timescaledb_missing on MySQL
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO raw_log_reclaim_chunks AS c (chunk_name, range_start, range_end, state, bytes_before, raw_bytes, updated_at)
 		VALUES ($1, $2, $3, 'pending', $4, $5, now())
@@ -703,6 +716,7 @@ func (r *RawLogReclaimRepository) ReviveChunk(ctx context.Context, name string) 
 
 // MarkGoneChunks retires unfinished days whose chunk retention has dropped.
 func (r *RawLogReclaimRepository) MarkGoneChunks(ctx context.Context) error {
+	//npg:pg-only: TimescaleDB-only; Support() reports timescaledb_missing on MySQL
 	_, err := r.db.ExecContext(ctx, `
 		UPDATE raw_log_reclaim_chunks SET state = 'gone', updated_at = now()
 		 WHERE state IN ('pending', 'nulled', 'skipped', 'failed') AND to_regclass(chunk_name) IS NULL`)

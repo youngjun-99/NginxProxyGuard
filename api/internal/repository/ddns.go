@@ -3,21 +3,20 @@ package repository
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"time"
 
 	"github.com/lib/pq"
 
 	"nginx-proxy-guard/internal/database"
+	"nginx-proxy-guard/internal/database/dialect"
 	"nginx-proxy-guard/internal/model"
 )
 
 // isDDNSUniqueViolation reports whether err is a PostgreSQL unique-violation on
 // the (hostname, dns_provider_id) index (idx_ddns_records_hostname_provider).
 func isDDNSUniqueViolation(err error) bool {
-	var pqErr *pq.Error
-	return errors.As(err, &pqErr) && pqErr.Code == "23505"
+	return dialect.IsUniqueViolation(err)
 }
 
 // DDNSRepository persists DDNS records (#154).

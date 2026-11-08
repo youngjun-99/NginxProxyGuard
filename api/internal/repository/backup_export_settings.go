@@ -465,7 +465,8 @@ func (r *BackupRepository) exportRoles(ctx context.Context) ([]model.RoleExport,
 func (r *BackupRepository) exportSSOProviders(ctx context.Context) ([]model.SSOProviderExport, error) {
 	var present bool
 	if err := r.db.QueryRowContext(ctx,
-		`SELECT to_regclass('public.sso_providers') IS NOT NULL`).Scan(&present); err != nil || !present {
+		//npg:pg-only: tablesExistQuery swaps in the MySQL form
+		tablesExistQuery(`SELECT to_regclass('public.sso_providers') IS NOT NULL`, "sso_providers")).Scan(&present); err != nil || !present {
 		return nil, nil
 	}
 

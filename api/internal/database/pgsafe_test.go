@@ -1,6 +1,10 @@
 package database
 
-import "testing"
+import (
+	"testing"
+
+	"nginx-proxy-guard/internal/database/dialect"
+)
 
 // The strings below are what lib/pq actually renders, copied from a live
 // Postgres 17 reply rather than invented: Error() is "pq: <message>", the
@@ -105,4 +109,71 @@ func indexOf(haystack, needle string) int {
 		}
 	}
 	return -1
+}
+
+// On MySQL the driver writes "Error <number> (<SQLSTATE>): <message>"
+// (go-sql-driver's MySQLError.Error()), and the translator may refuse a
+// statement. Both are cut at the same boundary, and the reason comes from the
+// MySQL error number.
+func TestScrubDriverTextMySQL(t *testing.T) {
+	dialect.SetActive(dialect.MySQL)
+	defer dialect.SetActive(dialect.Postgres)
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{
+			name: "duplicate key keeps our wrapper, loses the key and value",
+			in:   "failed to create user: Error 1062 (23000): Duplicate entry 'admin' for key 'users.users_username_key'",
+			want: "failed to create user: A database error occurred",
+		},
+		{
+			name: "an over-long value names the cause",
+			in:   "failed to update provider: Error 1406 (22001): Data too long for column 'name' at row 1",
+			want: "failed to update provider: A value is longer than its field allows",
+		},
+		{
+			name: "a malformed value names the cause",
+			in:   "Error 1292 (22007): Incorrect datetime value: 'yesterday' for column 'expires_at' at row 1",
+			want: "Invalid identifier format",
+		},
+		{
+			name: "an error without SQLSTATE is still cut",
+			in:   "sync host: Error 1205: Lock wait timeout exceeded; try restarting transaction",
+			want: "sync host: A database error occurred",
+		},
+		{
+			name: "a statement the translator refused is cut before the SQL it quotes",
+			in:   "failed to list: statement cannot be translated for MySQL: generate_series() in SELECT generate_series(1, 2)",
+			want: "failed to list: A database error occurred",
+		},
+		{
+			name: "lib/pq text is still recognised",
+			in:   `x: pq: invalid input syntax for type uuid: "zz" (22P02)`,
+			want: "x: Invalid identifier format",
+		},
+		{
+			name: "application text is untouched",
+			in:   "acme: error presenting token: cloudflare: failed to find zone for example.com",
+			want: "acme: error presenting token: cloudflare: failed to find zone for example.com",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ScrubDriverText(tt.in); got != tt.want {
+				t.Errorf("ScrubDriverText(%q)\n got: %q\nwant: %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+// On PostgreSQL only lib/pq's prefix is a boundary: an upstream API that
+// words its own error "Error 1015: ..." must reach the operator untouched.
+func TestScrubDriverTextPostgresIgnoresMySQLShapes(t *testing.T) {
+	in := "dns: cloudflare: Error 1015: You are being rate limited"
+	if got := ScrubDriverText(in); got != in {
+		t.Errorf("ScrubDriverText(%q) = %q, want it untouched", in, got)
+	}
 }

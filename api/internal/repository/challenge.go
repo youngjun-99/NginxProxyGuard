@@ -9,8 +9,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/lib/pq"
-
+	"nginx-proxy-guard/internal/database/dialect"
 	"nginx-proxy-guard/internal/model"
 )
 
@@ -248,8 +247,7 @@ func (r *ChallengeRepository) CreateToken(ctx context.Context, proxyHostID *stri
 		&ct.IssuedAt, &ct.ExpiresAt, &ct.UseCount, &lastUsed, &ct.Revoked, &revokedAt, &revokedReason,
 	)
 	if err != nil {
-		var pqErr *pq.Error
-		if proxyHostID != nil && errors.As(err, &pqErr) && pqErr.Code == "23503" { // foreign_key_violation
+		if proxyHostID != nil && dialect.IsForeignKeyViolation(err) { // foreign_key_violation
 			return nil, ErrTokenHostGone
 		}
 		return nil, fmt.Errorf("failed to create challenge token: %w", err)

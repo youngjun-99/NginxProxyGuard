@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/lib/pq"
+
+	"nginx-proxy-guard/internal/database/dialect"
 	"nginx-proxy-guard/internal/model"
 )
 
@@ -24,20 +26,39 @@ func (r *ProxyHostRepository) List(ctx context.Context, page, perPage int, searc
 	// argument order so the same clause serves the count and the page query.
 	var conds []string
 	var args []interface{}
+	mysql := dialect.IsMySQL()
 	if search != "" {
 		n := len(args) + 1
-		conds = append(conds, fmt.Sprintf("(array_to_string(domain_names, ',') ILIKE $%d OR forward_host ILIKE $%d)", n, n))
+		if mysql {
+			// The stored lib/pq literal with its braces and quotes taken off is
+			// what array_to_string(domain_names, ',') gives.
+			conds = append(conds, fmt.Sprintf(`(REPLACE(SUBSTRING(domain_names, 2, CHAR_LENGTH(domain_names) - 2), '"', '') ILIKE $%d OR forward_host ILIKE $%d)`, n, n))
+		} else {
+			//npg:pg-only
+			conds = append(conds, fmt.Sprintf("(array_to_string(domain_names, ',') ILIKE $%d OR forward_host ILIKE $%d)", n, n))
+		}
 		args = append(args, "%"+search+"%")
 	}
 	if len(filter.Tags) > 0 {
 		// @> is "contains every element" — the AND semantics the filter promises.
-		conds = append(conds, fmt.Sprintf("tags @> $%d::text[]", len(args)+1))
-		args = append(args, pq.Array(filter.Tags))
+		if mysql {
+			// No array containment on MySQL: one membership test per tag.
+			tagConds := make([]string, len(filter.Tags))
+			for i, tag := range filter.Tags {
+				tagConds[i] = fmt.Sprintf("$%d = ANY(tags)", len(args)+1)
+				args = append(args, tag)
+			}
+			conds = append(conds, "("+strings.Join(tagConds, " AND ")+")")
+		} else {
+			//npg:pg-only
+			conds = append(conds, fmt.Sprintf("tags @> $%d::text[]", len(args)+1))
+			args = append(args, pq.Array(filter.Tags))
+		}
 	}
 	if filter.Domain != "" {
 		// Same bucket expression the /groups aggregate uses, so clicking a
 		// group cannot return zero rows.
-		conds = append(conds, fmt.Sprintf(`%s = $%d`, proxyHostDomainBucketExpr, len(args)+1))
+		conds = append(conds, fmt.Sprintf(`%s = $%d`, proxyHostDomainBucketExprActive(), len(args)+1))
 		args = append(args, filter.Domain)
 	}
 	if filter.Upstream != "" {
@@ -223,8 +244,13 @@ func (r *ProxyHostRepository) CheckDomainExists(ctx context.Context, domains []s
 		return nil, nil
 	}
 
+	if dialect.IsMySQL() {
+		return r.checkDomainExistsMySQL(ctx, domains, excludeID)
+	}
+
 	// Single query: unnest stored domain_names, intersect with input set in one pass.
 	// Was: N round-trips (one SELECT per domain). Now: one SELECT.
+	//npg:pg-only
 	query := `
 		SELECT DISTINCT d
 		FROM proxy_hosts, UNNEST(domain_names) AS d
@@ -257,6 +283,42 @@ func (r *ProxyHostRepository) CheckDomainExists(ctx context.Context, domains []s
 	}
 
 	return existingDomains, nil
+}
+
+// checkDomainExistsMySQL is CheckDomainExists on MySQL: JSON_TABLE over the
+// stored array's JSON view stands in for UNNEST, and the input set is an IN
+// list.
+func (r *ProxyHostRepository) checkDomainExistsMySQL(ctx context.Context, domains []string, excludeID string) ([]string, error) {
+	query := `SELECT DISTINCT n.d FROM proxy_hosts p
+		CROSS JOIN JSON_TABLE(` + mysqlArrayJSON("p.domain_names") + `, '$[*]' COLUMNS (d VARCHAR(512) PATH '$')) AS n
+		WHERE n.d IN (` + strings.TrimSuffix(strings.Repeat("?, ", len(domains)), ", ") + `)
+		  AND COALESCE(p.proxy_type, 'http') = 'http'`
+	args := make([]interface{}, 0, len(domains)+1)
+	for _, d := range domains {
+		args = append(args, d)
+	}
+	if excludeID != "" {
+		query += ` AND p.id <> ?`
+		args = append(args, excludeID)
+	}
+
+	rows, err := r.db.QueryContext(ctx, dialect.Raw(query), args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check domain existence: %w", err)
+	}
+	defer rows.Close()
+	var existing []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return nil, fmt.Errorf("failed to scan existing domain: %w", err)
+		}
+		existing = append(existing, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("failed to iterate domain check rows: %w", err)
+	}
+	return existing, nil
 }
 
 // CheckStreamListenConflicts validates TCP/UDP stream listener collisions.

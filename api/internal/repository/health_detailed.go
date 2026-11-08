@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"github.com/lib/pq"
+
+	"nginx-proxy-guard/internal/database/dialect"
 )
 
 // HealthDetailedRepository surfaces storage + compression telemetry used by
@@ -36,6 +38,11 @@ type HypertableStats struct {
 // catalog rows on errors so a missing timescaledb_information view (older PG
 // or a non-Timescale fallback) does not block the entire health response.
 func (r *HealthDetailedRepository) GetHypertableStats(ctx context.Context) ([]HypertableStats, error) {
+	// MySQL has no hypertables: no rows is the honest answer, not an error.
+	if dialect.IsMySQL() {
+		return nil, nil
+	}
+	//npg:pg-only
 	const q = `
 		SELECT h.hypertable_name,
 		       h.compression_enabled,
@@ -100,6 +107,15 @@ func (r *HealthDetailedRepository) GetHypertableStats(ctx context.Context) ([]Hy
 // is not: it answered 71,000 for the same table, because it rests on the same
 // reltuples estimates.
 func (r *HealthDetailedRepository) GetAccessLogRowCount(ctx context.Context) (int64, error) {
+	// MySQL: InnoDB's own row estimate for the table, which is what an O(1)
+	// count can be there; COUNT(*) walks the clustered index.
+	if dialect.IsMySQL() {
+		var n int64
+		err := queryFreshTableStats(ctx, r.db,
+			"SELECT COALESCE(MAX(TABLE_ROWS), 0) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'logs_partitioned'",
+			nil, &n)
+		return n, err
+	}
 	return r.hypertableRowCount(ctx, "public", "logs_partitioned")
 }
 
@@ -108,6 +124,7 @@ func (r *HealthDetailedRepository) GetAccessLogRowCount(ctx context.Context) (in
 func (r *HealthDetailedRepository) hypertableRowCount(ctx context.Context, schema, table string) (int64, error) {
 	// Uncompressed chunks: the estimate is still right for these, and it is the
 	// cheap half. reltuples is -1 until a chunk is first analyzed.
+	//npg:pg-only
 	const uncompressed = `
 		SELECT COALESCE(SUM(GREATEST(c.reltuples, 0))::bigint, 0)
 		FROM timescaledb_information.chunks ch
@@ -123,6 +140,7 @@ func (r *HealthDetailedRepository) hypertableRowCount(ctx context.Context, schem
 
 	// Compressed chunks: exact, from the batch counts. Their compressed
 	// relations have to be found first because each is a separate relation.
+	//npg:pg-only
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT cn.nspname, cc.relname
 		FROM timescaledb_information.chunks ch
@@ -146,6 +164,7 @@ func (r *HealthDetailedRepository) hypertableRowCount(ctx context.Context, schem
 		if err := rows.Scan(&relSchema, &relName); err != nil {
 			return total, nil
 		}
+		//npg:pg-only
 		parts = append(parts, fmt.Sprintf(`SELECT COALESCE(SUM(_ts_meta_count),0)::bigint AS n FROM %s.%s`,
 			pq.QuoteIdentifier(relSchema), pq.QuoteIdentifier(relName)))
 	}
